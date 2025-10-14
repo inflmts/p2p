@@ -10,185 +10,143 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 
 #define P2P_CHOKE     0
 #define P2P_UNCHOKE   1
-#define P2P_WANT      2
-#define P2P_NOWANT    3
+#define P2P_INT       2
+#define P2P_NOINT     3
 #define P2P_HAVE      4
 #define P2P_BITFIELD  5
 #define P2P_REQUEST   6
 #define P2P_PIECE     7
 
 static const char magic[28] = "P2PFILESHARINGPROJ\0\0\0\0\0\0\0\0\0\0";
+static const char *config_delim = "\r\n ";
 static const int uno = 1;
+static const int cero = 0;
+
+static unsigned int num_preferred_neighbors = 3;
+static unsigned int unchoking_interval = 5;
+static unsigned int optimistic_unchoking_interval = 10;
+static char the_file_name[256] = "thefile";
+static unsigned int the_file_size;
+static unsigned int piece_size = 16384;
+static unsigned int num_pieces;
+static unsigned int bitfield_size;
+static unsigned int nbr_rcap;
+
+static unsigned int self_id;
+static uint16_t self_port;
+static int self_has_file;
+static int self_sock = -1;
+static unsigned char *self_bitfield;
+static unsigned int self_rem_pieces;
+static int logfd = -1;
+static char *the_file = MAP_FAILED;
 
 static void __attribute__((format(printf, 1, 2)))
 err(const char *format, ...)
 {
   va_list ap;
-  fputs("error: ", stderr);
+  char buf[2048], *p = buf;
+  p += snprintf(buf, sizeof(buf), "[%u] ", self_id);
   va_start(ap, format);
-  vfprintf(stderr, format, ap);
+  vsnprintf(p, buf + sizeof(buf) - p, format, ap);
   va_end(ap);
-  fputc('\n', stderr);
+  for (; *p; ++p)
+    if (*p < 0x20 || *p == 0x7f)
+      *p = '?';
+  *p = '\n';
+  write(2, buf, ++p - buf);
 }
 
-#define err_sys(format, ...) err(format ": %s", ##__VA_ARGS__, strerror(errno))
+#define err_sys_(format, ...) err(format ": %s", __VA_ARGS__)
+#define err_sys(...) err_sys_(__VA_ARGS__, strerror(errno))
 
-/* Configuration */
-
-struct config
+static void __attribute__((format(printf, 1, 2)))
+shit(const char *format, ...)
 {
-  unsigned int num_preferred_neighbors;
-  unsigned int unchoking_interval;
-  unsigned int optimistic_unchoking_interval;
-  char file_name[1024];
-  unsigned int file_size;
-  unsigned int piece_size;
-  unsigned int num_pieces;
-  unsigned int bitfield_size;
-};
+  va_list ap;
+  char buf[2048], *p = buf;
+  time_t tim = time(NULL);
+  struct tm *tm = localtime(&tim);
+  p += strftime(buf, sizeof(buf), "%Y-%m-%d %I:%M:%S %p: ", tm);
+  va_start(ap, format);
+  vsnprintf(p, buf + sizeof(buf) - p, format, ap);
+  va_end(ap);
+  for (; *p; ++p)
+    if (*p < 0x20 || *p == 0x7f)
+      *p = '?';
+  *p = '\n';
+  write(logfd, buf, ++p - buf);
+}
 
 static int
-config_parse_uint(const char *s, unsigned int *dest)
+parse_pint(const char *s, unsigned int *dest)
 {
-  const char *t = s;
   unsigned int value = 0;
-  do {
-    if (*t < '0' || *t > '9')
-      return -1;
-    value = value * 10 + (*t - '0');
-  } while (*(++t));
+  while (*s >= '0' && *s <= '9')
+    value = value * 10 + (*(s++) - '0');
+  if (*s || !value)
+    return -1;
   *dest = value;
   return 0;
 }
 
-static int
-config_load(struct config *cfg, const char *filename)
+/* Configuration */
+
+static void
+config_load(const char *filename)
 {
   FILE *f = fopen(filename, "r");
   if (!f) {
     err_sys("could not open '%s'", filename);
-    return -1;
+    exit(1);
   }
-  cfg->num_preferred_neighbors = 3;
-  cfg->unchoking_interval = 5;
-  cfg->optimistic_unchoking_interval = 10;
-  strcpy(cfg->file_name, "thefile");
-  cfg->file_size = 0;
-  cfg->piece_size = 16384;
-  static const char *delim = "\r\n ";
   char line[1024];
   while (fgets(line, sizeof(line), f)) {
-    char *key = strtok(line, delim);
+    char *key = strtok(line, config_delim);
     if (!key || key[0] == '#') {
-      /* empty line */
-      continue;
+      continue; /* empty line or comment */
     }
-    char *value = strtok(NULL, delim);
+    char *value = strtok(NULL, config_delim);
     if (!value) {
       goto fail;
     }
     if (!strcmp(key, "NumberOfPreferredNeighbors")) {
-      if (config_parse_uint(value, &cfg->num_preferred_neighbors))
+      if (parse_pint(value, &num_preferred_neighbors))
         goto fail;
     } else if (!strcmp(key, "UnchokingInterval")) {
-      if (config_parse_uint(value, &cfg->unchoking_interval))
+      if (parse_pint(value, &unchoking_interval))
         goto fail;
     } else if (!strcmp(key, "OptimisticUnchokingInterval")) {
-      if (config_parse_uint(value, &cfg->optimistic_unchoking_interval))
+      if (parse_pint(value, &optimistic_unchoking_interval))
         goto fail;
     } else if (!strcmp(key, "FileName")) {
-      strcpy(cfg->file_name, value);
+      strcpy(the_file_name, value);
     } else if (!strcmp(key, "FileSize")) {
-      if (config_parse_uint(value, &cfg->file_size))
+      if (parse_pint(value, &the_file_size))
         goto fail;
     } else if (!strcmp(key, "PieceSize")) {
-      if (config_parse_uint(value, &cfg->piece_size))
+      if (parse_pint(value, &piece_size))
         goto fail;
     } else {
       goto fail;
     }
   }
   fclose(f);
-  cfg->num_pieces = (cfg->file_size + cfg->piece_size - 1) / cfg->piece_size;
-  cfg->bitfield_size = (cfg->num_pieces + 7) >> 3;
-  return 0;
+  num_pieces = (the_file_size + piece_size - 1) / piece_size;
+  bitfield_size = (num_pieces + 7) >> 3;
+  /* doesn't matter what this is as long as any valid message will fit */
+  nbr_rcap = bitfield_size + piece_size + 1024;
+  return;
 fail:
-  fclose(f);
   err("failed to parse '%s'", filename);
-  return -1;
-}
-
-/* Peer Info */
-
-struct peerinfo
-{
-  unsigned int id;
-  uint16_t port;
-  char host[240];
-  struct peerinfo *next;
-};
-
-static void
-peerinfo_free(struct peerinfo *pi)
-{
-  while (pi) {
-    struct peerinfo *next = pi->next;
-    free(pi);
-    pi = next;
-  }
-}
-
-static struct peerinfo *
-peerinfo_load(const char *filename, unsigned int my_id, uint16_t *my_port,
-    int *i_have_file)
-{
-  FILE *f = fopen(filename, "r");
-  if (!f) {
-    err_sys("could not open '%s'", filename);
-    return NULL;
-  }
-  struct peerinfo *pi = NULL;
-  struct peerinfo **lastpi = &pi;
-  char line[240];
-  while (fgets(line, sizeof(line), f)) {
-    char *fields[4];
-    unsigned int id, port, has_file;
-    if (!(fields[0] = strtok(line, "\r\n ")) ||
-        !(fields[1] = strtok(NULL, "\r\n ")) ||
-        !(fields[2] = strtok(NULL, "\r\n ")) ||
-        !(fields[3] = strtok(NULL, "\r\n ")) ||
-        config_parse_uint(fields[0], &id) ||
-        config_parse_uint(fields[2], &port)) {
-      goto abort;
-    }
-    if (!strcmp(fields[3], "0")) {
-      has_file = 0;
-    } else if (!strcmp(fields[3], "1")) {
-      has_file = 1;
-    } else {
-      goto abort;
-    }
-    if (id == my_id) {
-      *my_port = port;
-      *i_have_file = has_file;
-      return pi;
-    }
-    *lastpi = malloc(sizeof(struct peerinfo));
-    (*lastpi)->id = id;
-    (*lastpi)->port = port;
-    strcpy((*lastpi)->host, fields[1]);
-    lastpi = &(*lastpi)->next;
-  }
-  err("could not find peer ID %u", my_id);
-abort:
-  peerinfo_free(pi);
-  return NULL;
+  exit(1);
 }
 
 /* Event Loop */
@@ -219,48 +177,39 @@ ev_register(int fd, int events, ev_callback callback, void *userdata)
   ev_pollfds[ev_count].revents = 0;
   ev_handlers[ev_count].callback = callback;
   ev_handlers[ev_count].userdata = userdata;
+  ++ev_count;
 }
 
 /* Neighbor */
 
-#define NEIGHBOR_WRITING  1
-#define NEIGHBOR_WFLOW    2
-#define NEIGHBOR_WWANT    4
-#define NEIGHBOR_RFLOW    8
-#define NEIGHBOR_RWANT    16
-
-struct self
-{
-  unsigned int id;
-  int sock;
-  unsigned char *bitfield;
-  int log;
-  char *file;
-  struct config *cfg;
-  struct neighbor *nbr_head;
-  struct neighbor *nbr_tail;
-};
+#define NEIGHBOR_CONN   1
+#define NEIGHBOR_WFLOW  2
+#define NEIGHBOR_WINT   4
+#define NEIGHBOR_RFLOW  8
+#define NEIGHBOR_RINT   16
 
 struct neighbor
 {
   unsigned int id;
   int sock;
+  char host[256];
+  uint16_t port;
   unsigned char *bitfield;
   char *wbuf;
   char *rbuf;
   int flags;
   unsigned int wcap;
   unsigned int wsize;
-  unsigned int rcap;
   unsigned int rsize;
-  unsigned int rtarget;
+  int rtarget;
   void (*on_read)(struct neighbor *, char *);
-  struct self *me;
-  struct config *cfg;
   struct neighbor *prev;
   struct neighbor *next;
 };
 
+static struct neighbor *nbr_head;
+
+/*
 static void
 neighbor_destroy(struct neighbor *nbr)
 {
@@ -279,81 +228,44 @@ neighbor_destroy(struct neighbor *nbr)
   free(nbr->rbuf);
   free(nbr);
 }
+*/
 
-static void neighbor_read_handshake(struct neighbor *nbr, char *buf);
-static void neighbor_write_alloc(struct neighbor *nbr, unsigned int size);
-static void neighbor_flush(struct neighbor *nbr);
-static int neighbor_read_callback(void *userdata);
+static void quarantine(struct neighbor *nbr, int sock);
 
-static struct neighbor *
-neighbor_create(struct self *me, unsigned int id, int sock)
+static void
+neighbor_connect(struct neighbor *nbr)
 {
-  fcntl(sock, F_SETFL, O_NONBLOCK);
-
-  struct neighbor *nbr = malloc(sizeof(struct neighbor));
-  nbr->id = id;
-  nbr->sock = sock;
-  nbr->bitfield = NULL;
-  nbr->wbuf = NULL;
-  nbr->rbuf = NULL;
-  nbr->flags = 0;
-  nbr->wcap = 0;
-  nbr->wsize = 0;
-  nbr->rcap = 0;
-  nbr->rsize = 0;
-  nbr->rtarget = 32;
-  nbr->on_read = neighbor_read_handshake;
-  nbr->me = me;
-  nbr->cfg = me->cfg;
-  if ((nbr->prev = me->nbr_tail))
-    nbr->prev->next = nbr;
-  else
-    me->nbr_head = nbr;
-  me->nbr_tail = nbr;
-  nbr->next = NULL;
-
-  /* send handshake */
-  neighbor_write_alloc(nbr, 32);
-  uint32_t my_id_be = htonl(me->id);
-  memcpy(nbr->wbuf, magic, 28);
-  memcpy(nbr->wbuf + 28, &my_id_be, 4);
-  neighbor_flush(nbr);
-
-  /* start reading */
-  ev_register(nbr->sock, POLLIN, neighbor_read_callback, nbr);
-  return nbr;
-}
-
-static int
-neighbor_connect(const char *host, uint16_t port)
-{
-  struct addrinfo *ai, *ai_head;
-  int res = getaddrinfo(host, NULL, NULL, &ai_head);
-  if (!res) {
-    err("failed to resolve '%s': %s", host, gai_strerror(res));
-    return -1;
+  struct addrinfo *ai, *ai_head, hints = {
+    .ai_family = AF_UNSPEC,
+    .ai_socktype = SOCK_STREAM
+  };
+  int res = getaddrinfo(nbr->host, NULL, &hints, &ai_head);
+  if (res) {
+    err("failed to resolve '%s': %s", nbr->host, gai_strerror(res));
+    exit(1);
   }
-  uint16_t port_be = htons(port);
+  uint16_t port_be = htons(nbr->port);
   for (ai = ai_head; ai; ai = ai->ai_next) {
     if (ai->ai_family == AF_INET) {
       ((struct sockaddr_in *)ai->ai_addr)->sin_port = port_be;
     } else { /* AF_INET6 */
       ((struct sockaddr_in6 *)ai->ai_addr)->sin6_port = port_be;
     }
-    int sock = socket(ai->ai_family, SOCK_STREAM, 0);
-    if (sock == -1) {
+    nbr->sock = socket(ai->ai_family, SOCK_STREAM, 0);
+    if (nbr->sock == -1) {
       err_sys("socket");
-      goto abort;
+      exit(1);
     }
-    if (!connect(sock, ai->ai_addr, ai->ai_addrlen)) {
-      freeaddrinfo(ai_head);
-      return sock;
-    }
-    close(sock);
+    if (!connect(nbr->sock, ai->ai_addr, ai->ai_addrlen))
+      goto success;
+    err_sys("connect");
+    close(nbr->sock);
   }
-abort:
+  exit(1);
+success:
   freeaddrinfo(ai_head);
-  return -1;
+  shit("Peer %u makes a connection to Peer %u", self_id, nbr->id);
+  quarantine(nbr, nbr->sock);
 }
 
 static int
@@ -363,14 +275,13 @@ neighbor_write_callback(void *userdata)
   ssize_t bytes_sent = send(nbr->sock, nbr->wbuf, nbr->wsize, 0);
   if (bytes_sent < 0) {
     err_sys("send");
-    nbr->flags &= ~NEIGHBOR_WRITING;
+    // TODO: abort connection
+    nbr->wsize = 0;
     return 0;
   }
   nbr->wsize -= bytes_sent;
-  if (!nbr->wsize) {
-    nbr->flags &= ~NEIGHBOR_WRITING;
+  if (!nbr->wsize)
     return 0;
-  }
   memmove(nbr->wbuf, nbr->wbuf + bytes_sent, nbr->wsize);
   return 1;
 }
@@ -386,6 +297,8 @@ neighbor_write_alloc(struct neighbor *nbr, unsigned int size)
       nbr->wcap *= 2;
     nbr->wbuf = realloc(nbr->wbuf, nbr->wcap);
   }
+  if (nbr->wsize == size)
+    ev_register(nbr->sock, POLLOUT, neighbor_write_callback, nbr);
 }
 
 static void
@@ -400,11 +313,124 @@ neighbor_write(struct neighbor *nbr, int type, const void *buf, unsigned int siz
 }
 
 static void
-neighbor_flush(struct neighbor *nbr)
+neighbor_read_have(struct neighbor *nbr, char *buf)
 {
-  if (!(nbr->flags & NEIGHBOR_WRITING)) {
-    ev_register(nbr->sock, POLLOUT, neighbor_write_callback, nbr);
-    nbr->flags |= NEIGHBOR_WRITING;
+  uint32_t index;
+  memcpy(&index, buf, 4);
+  index = ntohl(index);
+  if (index >= num_pieces) {
+    // TODO: protocol error
+    return;
+  }
+  shit("Peer %u received the 'have' message from %u for the piece %lu.", self_id, nbr->id, (unsigned long)index);
+  unsigned int mask = 1 << (7 - (index & 7));
+  nbr->bitfield[index >> 3] |= mask;
+  if (!(self_bitfield[index >> 3] & mask) && !(nbr->flags & NEIGHBOR_RINT)) {
+    nbr->flags |= NEIGHBOR_RINT;
+    neighbor_write(nbr, P2P_INT, NULL, 0);
+  }
+  // TODO: maybe close connection
+  // TODO: do we need to send NOINT?
+}
+
+static void
+neighbor_read_bitfield(struct neighbor *nbr, char *buf)
+{
+  // TODO: handle padding
+  memcpy(nbr->bitfield, buf, bitfield_size);
+  // TODO: maybe close connection
+  for (unsigned int i = 0; i < bitfield_size; ++i) {
+    if (nbr->bitfield[i] & ~self_bitfield[i]) {
+      nbr->flags |= NEIGHBOR_RINT;
+      neighbor_write(nbr, P2P_INT, NULL, 0);
+      return;
+    }
+  }
+  nbr->flags &= ~NEIGHBOR_RINT;
+  neighbor_write(nbr, P2P_NOINT, NULL, 0);
+}
+
+static void
+neighbor_read_request(struct neighbor *nbr, char *buf)
+{
+  uint32_t index;
+  memcpy(&index, buf, 4);
+  index = ntohl(index);
+  if (!(nbr->flags & NEIGHBOR_WFLOW))
+    return; /* choked */
+  if (index >= num_pieces)
+    return; /* TODO: protocol error */
+  unsigned int offset = index * piece_size;
+  /* TODO: instrument read */
+  neighbor_write(nbr, P2P_PIECE, the_file + offset,
+      index == num_pieces - 1 ?
+      the_file_size - offset : piece_size);
+}
+
+static void
+neighbor_read_piece(struct neighbor *nbr, char *buf)
+{
+  uint32_t index;
+  memcpy(&index, buf, 4);
+  index = ntohl(index);
+  if (index >= num_pieces)
+    return; /* TODO: protocol error */
+  unsigned int mask = 1 << (7 - (index & 7));
+  if (self_bitfield[index >> 3] & mask)
+    return; /* already have piece */
+  unsigned int offset = index * piece_size;
+  /* TODO: instrument write */
+  memcpy(the_file + offset, buf + 4, index == num_pieces - 1 ?
+      the_file_size - offset : piece_size);
+  self_bitfield[index >> 3] |= mask;
+  --self_rem_pieces;
+  for (struct neighbor *oth = nbr_head; oth; oth = oth->next)
+    neighbor_write(oth, P2P_HAVE, buf, 4);
+  // TODO: send HAVE to all
+  // TODO: send NOINT
+}
+
+static void
+neighbor_read_header(struct neighbor *nbr, char *buf)
+{
+  uint32_t len;
+  memcpy(&len, buf, 4);
+  len = ntohl(len);
+  switch (buf[4]) {
+    case P2P_CHOKE:
+      shit("Peer %u is choked by %u.", self_id, nbr->id);
+      nbr->flags &= ~NEIGHBOR_RFLOW;
+      break;
+    case P2P_UNCHOKE:
+      shit("Peer %u is unchoked by %u.", self_id, nbr->id);
+      nbr->flags |= NEIGHBOR_RFLOW;
+      break;
+    case P2P_INT:
+      shit("Peer %u received the 'interested' message from %u.", self_id, nbr->id);
+      nbr->flags |= NEIGHBOR_WINT;
+      break;
+    case P2P_NOINT:
+      shit("Peer %u received the 'not interested' message from %u.", self_id, nbr->id);
+      nbr->flags &= ~NEIGHBOR_WINT;
+      break;
+    case P2P_HAVE:
+      nbr->rtarget = 4;
+      nbr->on_read = neighbor_read_have;
+      break;
+    case P2P_BITFIELD:
+      nbr->rtarget = bitfield_size;
+      nbr->on_read = neighbor_read_bitfield;
+      break;
+    case P2P_REQUEST:
+      nbr->rtarget = 4;
+      nbr->on_read = neighbor_read_request;
+      break;
+    case P2P_PIECE:
+      nbr->rtarget = 4 + piece_size;
+      nbr->on_read = neighbor_read_piece;
+      break;
+    default:
+      /* protocol error */
   }
 }
 
@@ -412,11 +438,7 @@ static int
 neighbor_read_callback(void *userdata)
 {
   struct neighbor *nbr = userdata;
-  if (nbr->rtarget > nbr->rcap) {
-    nbr->rcap = nbr->rtarget;
-    nbr->rbuf = realloc(nbr->rbuf, nbr->rcap);
-  }
-  ssize_t len = recv(nbr->sock, nbr->rbuf + nbr->rsize, nbr->rcap - nbr->rsize, 0);
+  ssize_t len = recv(nbr->sock, nbr->rbuf + nbr->rsize, nbr_rcap - nbr->rsize, 0);
   if (len < 0) {
     if (errno == EAGAIN || errno == EWOULDBLOCK)
       return 1;
@@ -427,7 +449,12 @@ neighbor_read_callback(void *userdata)
   char *buf = nbr->rbuf;
   while (nbr->rsize >= nbr->rtarget) {
     unsigned int target = nbr->rtarget;
+    nbr->rtarget = 0;
     nbr->on_read(nbr, buf);
+    if (!nbr->rtarget) {
+      nbr->rtarget = 5;
+      nbr->on_read = neighbor_read_header;
+    }
     buf += target;
     nbr->rsize -= target;
   }
@@ -436,264 +463,254 @@ neighbor_read_callback(void *userdata)
   return 1;
 }
 
-static void neighbor_read_message(struct neighbor *nbr, char *buf);
-
-static void
-neighbor_read_handshake(struct neighbor *nbr, char *buf)
-{
-  uint32_t id;
-  memcpy(&id, buf + sizeof(magic), 4);
-  id = ntohl(id);
-  if (memcmp(magic, buf, sizeof(magic)) || (nbr->id && nbr->id != id)) {
-    /* invalid */
-    return;
-  }
-  if (!nbr->id) {
-    nbr->id = id;
-    self_log(me, "Peer %u is connected from Peer %u", nbr->self->id, id);
-  }
-  nbr->rtarget = 5;
-  nbr->on_read = neighbor_read_message;
-}
-
-static void
-neighbor_read_have(struct neighbor *nbr, char *buf)
-{
-  uint32_t index;
-  memcpy(&index, buf, 4);
-  index = ntohl(index);
-  // TODO: update bitmap
-  nbr->rtarget = 5;
-  nbr->on_read = neighbor_read_message;
-}
-
-static void
-neighbor_read_bitfield(struct neighbor *nbr, char *buf)
-{
-  memcpy(nbr->bitfield, buf, nbr->cfg->bitfield_size);
-  // TODO: send WANT/NOWANT
-  nbr->rtarget = 5;
-  nbr->on_read = neighbor_read_message;
-}
-
-static void
-neighbor_read_request(struct neighbor *nbr, char *buf)
-{
-  uint32_t index;
-  memcpy(&index, buf, 4);
-  index = ntohl(index);
-  if (nbr->flags & NEIGHBOR_WFLOW) {
-    // TODO: validate
-    unsigned int offset = index * nbr->cfg->piece_size;
-    neighbor_write(nbr, P2P_PIECE, nbr->self->file + offset,
-        index == nbr->cfg->num_pieces - 1 ?
-        nbr->cfg->file_size - offset : nbr->cfg->piece_size);
-  }
-  nbr->rtarget = 5;
-  nbr->on_read = neighbor_read_message;
-}
-
-static void
-neighbor_read_piece(struct neighbor *nbr, char *buf)
-{
-  // TODO: store the piece
-  // TODO: update bitmap
-  // TODO: send HAVE to all
-  // TODO: send NOWANT
-  nbr->rtarget = 5;
-  nbr->on_read = neighbor_read_message;
-}
-
-static void
-neighbor_read_message(struct neighbor *nbr, char *buf)
-{
-  uint32_t len;
-  memcpy(&len, buf, 4);
-  len = ntohl(len);
-  switch (buf[4]) {
-    case P2P_CHOKE:
-      nbr->flags &= ~NEIGHBOR_RFLOW;
-      break;
-    case P2P_UNCHOKE:
-      nbr->flags |= NEIGHBOR_RFLOW;
-      break;
-    case P2P_WANT:
-      nbr->flags |= NEIGHBOR_WWANT;
-      break;
-    case P2P_NOWANT:
-      nbr->flags &= ~NEIGHBOR_WWANT;
-      break;
-    case P2P_HAVE:
-      nbr->rtarget = 4;
-      nbr->on_read = neighbor_read_have;
-      break;
-    case P2P_BITFIELD:
-      nbr->rtarget = nbr->cfg->bitfield_size;
-      nbr->on_read = neighbor_read_bitfield;
-      break;
-    case P2P_REQUEST:
-      nbr->rtarget = 4;
-      nbr->on_read = neighbor_read_request;
-      break;
-    case P2P_PIECE:
-      nbr->rtarget = 0;
-      nbr->on_read = neighbor_read_piece;
-      break;
-    default:
-      /* protocol error */
-  }
-}
-
 /* Self */
 
-static void
-self_free(struct self *me)
+struct quarantine
 {
-  if (me->sock != -1)
-    close(me->sock);
-  free(me->bitfield);
-  if (me->log != -1)
-    close(me->log);
-  if (me->file != MAP_FAILED)
-    munmap(me->file, me->cfg->file_size);
-}
-
-static int self_accept_callback(void *userdata);
+  struct neighbor *nbr;
+  int sock;
+  unsigned int wsize;
+  unsigned int rsize;
+  char wbuf[32];
+  char rbuf[32];
+};
 
 static int
-self_init(struct self *me, struct config *cfg, unsigned int id, uint16_t port,
-    int has_file)
+quarantine_write_callback(void *userdata)
 {
-  char filename[1056];
-  me->id = id;
-  me->sock = -1;
-  me->bitfield = NULL;
-  me->log = -1;
-  me->file = MAP_FAILED;
-  me->cfg = cfg;
-  me->nbr_head = NULL;
-  me->nbr_tail = NULL;
+  struct quarantine *q = userdata;
+  ssize_t len = send(q->sock, q->wbuf + q->wsize, sizeof(q->wbuf) - q->wsize, 0);
+  if (len < 0) {
+    err_sys("send");
+    return 0;
+  }
+  q->wsize += len;
+  return q->wsize < sizeof(q->wbuf);
+}
 
-  /* open log file */
-  snprintf(filename, sizeof(filename), "log_peer_%u.log", id);
-  me->log = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-  if (me->log == -1) {
-    err_sys("failed to open '%s'", filename);
-    goto abort;
+static int
+quarantine_read_callback(void *userdata)
+{
+  struct quarantine *q = userdata;
+  ssize_t len = recv(q->sock, q->rbuf + q->rsize, sizeof(q->rbuf) - q->rsize, 0);
+  if (len < 0) {
+    err_sys("recv");
+    free(q);
+    return 0;
   }
+  q->rsize += len;
+  if (q->rsize < sizeof(q->rbuf))
+    return 1; /* wait for more */
 
-  /* open the file */
-  snprintf(filename, sizeof(filename), "peer_%u/%s", id, cfg->file_name);
-  int fd = open(filename, O_RDWR | O_CREAT, 0666);
-  if (fd == -1) {
-    err_sys("failed to open '%s'", filename);
-    goto abort;
+  /* check handshake */
+  uint32_t id;
+  memcpy(&id, q->rbuf + sizeof(magic), 4);
+  id = ntohl(id);
+  if (memcmp(magic, q->rbuf, sizeof(magic)) || (q->nbr && q->nbr->id != id)) {
+    err("invalid handshake");
+    free(q);
+    return 0; /* TODO: drop connection */
   }
-  me->file = mmap(NULL, cfg->file_size, PROT_READ, MAP_SHARED, fd, 0);
-  if (me->file == MAP_FAILED) {
-    err_sys("failed to mmap '%s'", filename);
-    close(fd);
-    goto abort;
+  struct neighbor *nbr = q->nbr;
+  if (!nbr) {
+    for (nbr = nbr_head; nbr; nbr = nbr->next) {
+      if (nbr->id == id) {
+        if (nbr->sock != -1) {
+          err("[~%u] already connected", id);
+          free(q);
+          return 0; /* doppelganger */
+        }
+        goto found;
+      }
+    }
+    free(q);
+    return 0;
+found:
+    shit("Peer %u is connected from Peer %u", self_id, id);
+    nbr->sock = q->sock;
   }
-  close(fd);
-
-  /* start server */
-  me->sock = socket(AF_INET, SOCK_STREAM, 0);
-  if (me->sock == -1) {
-    err_sys("socket");
-    goto abort;
+  if (q->wsize < sizeof(q->wbuf)) {
+    // TODO: implement this function
+    //ev_abort(q);
+    neighbor_write_alloc(nbr, sizeof(q->wbuf) - q->wsize);
+    memcpy(nbr->wbuf, q->wbuf + q->wsize, sizeof(q->wbuf) - q->wsize);
   }
-  setsockopt(me->sock, SOL_SOCKET, SO_REUSEADDR, &uno, sizeof(uno));
-  struct sockaddr_in addr;
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons(port);
-  addr.sin_addr.s_addr = 0;
-  if (bind(me->sock, (const struct sockaddr *)&addr, sizeof(addr))) {
-    err_sys("bind");
-    goto abort;
-  }
-  if (listen(me->sock, 16)) {
-    err_sys("listen");
-    goto abort;
-  }
-  fcntl(me->sock, F_SETFL, O_NONBLOCK);
-  ev_register(me->sock, POLLIN, self_accept_callback, me);
+  ev_register(nbr->sock, POLLIN, neighbor_read_callback, nbr);
+  free(q);
   return 0;
-
-abort:
-  self_free(me);
-  return -1;
 }
 
-static void __attribute__((format(printf, 2, 3)))
-self_log(struct self *me, const char *format, ...)
+static void
+quarantine(struct neighbor *nbr, int sock)
 {
-  char buf[2048];
-  time_t tim = time(NULL);
-  struct tm *tm = localtime(&tim);
-  int len = strftime(buf, sizeof(buf), "%y-%m-%d %I:%M:%S %p: ", tm);
-  va_list ap;
-  va_start(ap, format);
-  len += vsnprintf(buf + len, sizeof(buf) - len, format, ap) + 1;
-  va_end(ap);
-  if (len > sizeof(buf))
-    len = sizeof(buf);
-  buf[len - 1] = '\n';
-  write(me->log, buf, len);
+  struct quarantine *q = calloc(1, sizeof(*q));
+  /* send handshake */
+  uint32_t my_id_be = htonl(self_id);
+  q->nbr = nbr;
+  q->sock = sock;
+  memcpy(q->wbuf, magic, sizeof(magic));
+  memcpy(q->wbuf + sizeof(magic), &my_id_be, 4);
+  ev_register(q->sock, POLLOUT, quarantine_write_callback, q);
+  ev_register(q->sock, POLLIN, quarantine_read_callback, q);
 }
 
 static int
-self_accept_callback(void *userdata)
+self_accept_callback(void *_unused)
 {
-  struct self *me = userdata;
-  int sock = accept(me->sock, NULL, NULL);
+  int sock = accept(self_sock, NULL, NULL);
   if (sock == -1) {
-    if (errno == EAGAIN || errno == EWOULDBLOCK)
+    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ECONNABORTED)
       return 1;
+    /* give up, stop accepting new connections */
     err_sys("accept");
     return 0;
   }
-  neighbor_create(me, 0, sock);
+  quarantine(NULL, sock);
   return 1;
 }
 
-/* Main */
+static void
+peerinfo_load(const char *filename)
+{
+  FILE *f = fopen(filename, "r");
+  if (!f) {
+    err_sys("could not open '%s'", filename);
+    exit(1);
+  }
+  char line[1024];
+  while (fgets(line, sizeof(line), f)) {
+    char *fid, *fhst, *fprt, *fhas;
+    unsigned int id, port;
+    if (!(fid  = strtok(line, config_delim)) ||
+        !(fhst = strtok(NULL, config_delim)) ||
+        !(fprt = strtok(NULL, config_delim)) ||
+        !(fhas = strtok(NULL, config_delim)) ||
+        parse_pint(fid, &id) || !id ||
+        parse_pint(fprt, &port) || !port || port > 0xffff) {
+      goto abort;
+    }
+    if (id == self_id) {
+      self_port = port;
+      self_has_file = !strcmp(fhas, "1");
+      continue;
+    }
+    struct neighbor *tail = NULL, *nbr;
+    for (nbr = nbr_head; nbr; tail = nbr, nbr = nbr->next)
+      if (nbr->id == id)
+        goto abort;
+    nbr = calloc(1, sizeof(*nbr));
+    nbr->id = id;
+    nbr->sock = -1;
+    size_t hostlen = strlen(fhst);
+    memcpy(nbr->host, fhst, hostlen < sizeof(nbr->host) ? hostlen : sizeof(nbr->host) - 1);
+    nbr->port = port;
+    if (!self_port)
+      nbr->flags |= NEIGHBOR_CONN;
+    nbr->rbuf = malloc(nbr_rcap);
+    nbr->rtarget = 5;
+    nbr->on_read = neighbor_read_header;
+    nbr->prev = tail;
+    nbr->next = NULL;
+    if (tail)
+      tail->next = nbr;
+    else
+      nbr_head = nbr;
+  }
+  fclose(f);
+  if (!self_port) {
+    err("could not find self configuration");
+    exit(1);
+  }
+  return;
+abort:
+  err("could not parse '%s'", filename);
+  exit(1);
+}
 
 int main(int argc, char **argv)
 {
-  if (argc != 2) {
-    fprintf(stderr, "usage: %s <peer_id>\n", argv[0]);
+  static const char usage[] = "usage: peer <peer_id>\n";
+  if (argc != 2 || parse_pint(argv[1], &self_id)) {
+    write(2, usage, sizeof(usage) - 1);
     return 2;
   }
 
-  unsigned int self_id;
-  uint16_t self_port;
-  int self_has_file;
-  struct config cfg;
-  struct peerinfo *pi_head, *pi;
-  struct self me;
+  config_load("Common.cfg");
+  peerinfo_load("PeerInfo.cfg");
 
-  if (config_parse_uint(argv[1], &self_id))
-    return 2;
-
-  if (config_load(&cfg, "Common.cfg"))
-    return 1;
-
-  pi_head = peerinfo_load("PeerInfo.cfg", self_id, &self_port, &self_has_file);
-  if (!pi_head)
-    return 1;
-
-  if (self_init(&me, &cfg, self_id, self_port, self_has_file))
-    return 1;
-
-  for (pi = pi_head; pi; pi = pi->next) {
-    int sock = neighbor_connect(pi->host, pi->port);
-    if (sock == -1)
-      return -1;
-    self_log(&me, "Peer %u makes a connection to Peer %u", me.id, pi->id);
-    neighbor_create(&me, pi->id, sock);
+  self_bitfield = calloc(1, bitfield_size);
+  if (self_has_file) {
+    /* TODO: handle padding */
+    memset(self_bitfield, -1, bitfield_size);
+  } else {
+    self_rem_pieces = num_pieces;
   }
 
+  char filename[1024];
+  struct sockaddr_in6 addr = {
+    .sin6_family = AF_INET6,
+    .sin6_port = htons(self_port),
+    .sin6_addr = IN6ADDR_ANY_INIT
+  };
+
+  /* start server */
+  self_sock = socket(AF_INET6, SOCK_STREAM, 0);
+  if (self_sock == -1) {
+    err_sys("socket");
+    exit(1);
+  }
+  setsockopt(self_sock, IPPROTO_IPV6, IPV6_V6ONLY, &cero, sizeof(cero));
+  setsockopt(self_sock, SOL_SOCKET, SO_REUSEADDR, &uno, sizeof(uno));
+  if (bind(self_sock, (const struct sockaddr *)&addr, sizeof(addr))) {
+    err_sys("could not bind to port %u", (unsigned int)self_port);
+    exit(1);
+  }
+  if (listen(self_sock, 16)) {
+    err_sys("listen");
+    exit(1);
+  }
+  fcntl(self_sock, F_SETFL, O_NONBLOCK);
+  ev_register(self_sock, POLLIN, self_accept_callback, NULL);
+
+  /* open log file */
+  snprintf(filename, sizeof(filename), "log_peer_%u.log", self_id);
+  logfd = 2; //open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  if (logfd == -1) {
+    err_sys("failed to open '%s'", filename);
+    exit(1);
+  }
+
+  /* create the directory if necessary */
+  snprintf(filename, sizeof(filename), "peer_%u", self_id);
+  if (mkdir(filename, 0777) && errno != EEXIST) {
+    err_sys("failed to create directory '%s'", filename);
+    exit(1);
+  }
+
+  /* open the file */
+  snprintf(filename, sizeof(filename), "peer_%u/%s", self_id, the_file_name);
+  int the_fd = open(filename, self_has_file ? O_RDONLY : O_RDWR | O_CREAT, 0666);
+  if (the_fd == -1) {
+    err_sys("failed to open '%s'", filename);
+    exit(1);
+  }
+  the_file = mmap(NULL, the_file_size, self_has_file ?
+      PROT_READ : PROT_READ | PROT_WRITE, MAP_SHARED, the_fd, 0);
+  if (the_file == MAP_FAILED) {
+    err_sys("failed to mmap '%s'", filename);
+    exit(1);
+  }
+  close(the_fd);
+
+  /* connect neighbors */
+  usleep(100000); /* TODO: currently sleeping for 100ms */
+  for (struct neighbor *nbr = nbr_head; nbr; nbr = nbr->next) {
+    if (nbr->flags & NEIGHBOR_CONN) {
+      neighbor_connect(nbr);
+    }
+  }
+
+  /* event loop */
   while (ev_count) {
     int count = poll(ev_pollfds, ev_count, -1);
     if (count < 0) {
@@ -703,12 +720,16 @@ int main(int argc, char **argv)
     int i = 0;
     while (count) {
       int revents = ev_pollfds[i].revents;
-      if (!revents || ev_handlers[i].callback(ev_handlers[i].userdata)) {
+      if (!revents) {
+        ++i;
+        continue;
+      }
+      --count;
+      if (ev_handlers[i].callback(ev_handlers[i].userdata)) {
         ++i;
         continue;
       }
       --ev_count;
-      --count;
       if (i != ev_count) {
         memcpy(&ev_pollfds[i], &ev_pollfds[ev_count], sizeof(*ev_pollfds));
         memcpy(&ev_handlers[i], &ev_handlers[ev_count], sizeof(*ev_handlers));
@@ -716,7 +737,5 @@ int main(int argc, char **argv)
     }
   }
 
-  free(ev_pollfds);
-  free(ev_handlers);
   return 0;
 }
