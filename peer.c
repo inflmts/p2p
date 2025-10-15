@@ -622,7 +622,7 @@ found:
   }
   // TODO: initialize bitfield here?
   nbr->bitfield = calloc(1, bitfield_size);
-  neighbor_write(nbr, P2P_BITFIELD, nbr->bitfield, bitfield_size);
+  neighbor_write(nbr, P2P_BITFIELD, self_bitfield, bitfield_size);
   ev_register(nbr->sock, POLLIN, neighbor_read_callback, nbr);
 destroy:
   ev_detach(NULL, q);
@@ -811,13 +811,13 @@ int main(int argc, char **argv)
     clock_gettime(CLOCK_MONOTONIC, &ts);
     now = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
     timeout = unchoke_at - now;
-    if (timeout > unchoking_interval) {
+    if (timeout - 1 > unchoking_interval) {
       reselect_preferred_neighbors();
       unchoke_at = now + unchoking_interval;
       timeout = unchoking_interval;
     }
     timeout2 = optimistic_unchoke_at - now;
-    if (timeout2 > optimistic_unchoking_interval) {
+    if (timeout2 - 1 > optimistic_unchoking_interval) {
       optimistic_unchoke_neighbor();
       optimistic_unchoke_at = now + optimistic_unchoking_interval;
       timeout2 = optimistic_unchoking_interval;
