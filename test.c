@@ -48,7 +48,7 @@ int main(int argc, char **argv)
         if (WIFSIGNALED(wstatus)) {
           fprintf(stderr, "[%u] %s\n", i + BASE_ID, strsignal(WTERMSIG(wstatus)));
           ret = 1;
-        } else if (WEXITSTATUS(wstatus)) {
+        } else {
           fprintf(stderr, "[%u] exited %d\n", i + BASE_ID, WEXITSTATUS(wstatus));
           ret = 1;
         }
