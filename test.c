@@ -32,8 +32,8 @@ int main(int argc, char **argv)
     }
     if (pid == 0) {
       /* child */
-    signal(SIGINT, SIG_DFL);
-    signal(SIGTERM, SIG_DFL);
+      signal(SIGINT, SIG_DFL);
+      signal(SIGTERM, SIG_DFL);
       execve("peer", args, environ);
       fprintf(stderr, "fatal: failed to execute peer process: %s\n", strerror(errno));
       exit(-1);
