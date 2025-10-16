@@ -50,7 +50,9 @@ int main(int argc, char **argv)
           ret = 1;
         } else {
           fprintf(stderr, "[%u] exited %d\n", i + BASE_ID, WEXITSTATUS(wstatus));
-          ret = 1;
+          if (WEXITSTATUS(wstatus)) {
+            ret = 1;
+          }
         }
       }
     }
