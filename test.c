@@ -5,20 +5,21 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define BASE_ID 101
-#define NUM_PEERS 5
+#define MAX_PEERS 32
 
 extern char **environ;
 static char env[64];
+static const char *filename = "PeerInfo.cfg";
 
 int main(int argc, char **argv)
 {
-  char *args[3];
   char arg[32];
+  char *args[3] = { "peer", arg, NULL };
   int pipefd[2];
-  unsigned int id;
-  int ret, wstatus;
-  pid_t pids[NUM_PEERS];
+  int id, ret, wstatus;
+  int num_peers = 0;
+  int ids[MAX_PEERS];
+  pid_t pids[MAX_PEERS];
   pid_t pid;
   if (pipe(pipefd)) {
     fprintf(stderr, "fatal: pipe: %s\n", strerror(errno));
@@ -26,11 +27,14 @@ int main(int argc, char **argv)
   }
   sprintf(env, "P2P_NOTIFY_FD=%d", pipefd[1]);
   putenv(env);
-  args[0] = "peer";
-  args[1] = arg;
-  args[2] = NULL;
-  for (int i = 0; i < NUM_PEERS; ++i) {
-    id = BASE_ID + i;
+  FILE *f = fopen(filename, "r");
+  if (!f) {
+    fprintf(stderr, "fatal: could not open '%s': %s\n", filename, strerror(errno));
+    exit(-1);
+  }
+  char line[1024];
+  while (fgets(line, sizeof(line), f) && num_peers < MAX_PEERS) {
+    id = atoi(strtok(line, "\r\n "));
     sprintf(arg, "%u", id);
     pid = fork();
     if (pid < 0) {
@@ -41,16 +45,19 @@ int main(int argc, char **argv)
       /* child */
       execve("peer", args, environ);
       fprintf(stderr, "fatal: failed to execute peer process: %s\n", strerror(errno));
-      exit(-1);
+      _exit(-1);
     }
-    pids[i] = pid;
+    ids[num_peers] = id;
+    pids[num_peers] = pid;
     read(pipefd[0], &arg, 1);
+    ++num_peers;
   }
+  fclose(f);
   ret = 0;
   while ((pid = wait(&wstatus)) != -1) {
-    for (int i = 0; i < NUM_PEERS; ++i) {
+    for (int i = 0; i < num_peers; ++i) {
       if (pids[i] == pid) {
-        id = i + BASE_ID;
+        id = ids[i];
         if (WIFSIGNALED(wstatus)) {
           fprintf(stderr, "[peer %u: %s]\n", id, strsignal(WTERMSIG(wstatus)));
           ret = 1;
