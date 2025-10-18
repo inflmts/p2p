@@ -57,7 +57,6 @@ int main(int argc, char **argv)
   char arg[32];
   char *args[3] = { "peer", arg, NULL };
   for (int i = 0; i < num_peers; ++i) {
-    msg("[starting peer %d]", ids[i]);
     pid = fork();
     if (pid < 0) {
       fatal("fork");
@@ -68,6 +67,7 @@ int main(int argc, char **argv)
       struct timespec ts = { i / 5, (i % 5) * 200000000 };
       nanosleep(&ts, NULL);
       sprintf(arg, "%d", ids[i]);
+      msg("[starting peer %d]", ids[i]);
       execve("peer", args, environ);
       fatal("failed to execute peer process %d", ids[i]);
     }
