@@ -370,9 +370,7 @@ conn_handle_read(struct conn *c)
     c->rbuf = realloc(c->rbuf, (c->rcap = c->rwant));
   }
   ssize_t len = recv(c->sock, c->rbuf + c->rsize, c->rcap - c->rsize, 0);
-  if (len < 0)
-    die_sys("cannot recv from %u", c->id);
-  if (!len) {
+  if (len <= 0) {
     if (self_num_pieces != num_pieces)
       die("was disconnected by %u without the complete file", c->id);
     exit(0);
