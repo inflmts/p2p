@@ -96,7 +96,6 @@ read_uint32(const void *buf)
 #define CONN_RFLOW  8
 #define CONN_WPREF  32
 #define CONN_WOPT   64
-#define CONN_SHUT   128
 #define CONN_REQ    256
 #define CONN_WFLOW  (CONN_WPREF | CONN_WOPT)
 
@@ -190,9 +189,6 @@ conn_read_have(struct conn *c, char *buf)
     conn_write_header(c, 0, P2P_INT);
     conn_request(c);
   }
-  if (c->num_pieces == num_pieces && self_num_pieces == num_pieces) {
-    c->flags |= CONN_SHUT;
-  }
 }
 
 static void
@@ -216,8 +212,6 @@ conn_read_bitfield(struct conn *c, char *buf)
   } else {
     conn_write_header(c, 0, P2P_NOINT);
   }
-  if (c->num_pieces == num_pieces && self_num_pieces == num_pieces)
-    c->flags |= CONN_SHUT;
 }
 
 static void
@@ -268,8 +262,6 @@ conn_read_piece(struct conn *c, char *buf)
   for (c = conn_head; c; c = c->next) {
     conn_write_header(c, 4, P2P_HAVE);
     conn_write_uint32(c, index);
-    if (c->num_pieces == num_pieces && self_num_pieces == num_pieces)
-      c->flags |= CONN_SHUT;
   }
 }
 
@@ -288,13 +280,11 @@ conn_read_message(struct conn *c, char *buf)
         c->flags &= ~CONN_REQ;
         unsigned char mask = 128 >> (c->req & 7);
         self_pend[c->req >> 3] &= ~mask;
-        for (c = conn_head; c; c = c->next) {
-          if ((c->have[c->req >> 3] & mask) && !c->num_want++) {
+        for (c = conn_head; c; c = c->next)
+          if ((c->have[c->req >> 3] & mask) && !c->num_want++)
             conn_write_header(c, 0, P2P_INT);
-            conn_request(c);
-            break;
-          }
-        }
+        for (c = conn_head; c; c = c->next)
+          conn_request(c);
       }
       break;
     case P2P_UNCHOKE:
@@ -382,8 +372,11 @@ conn_handle_read(struct conn *c)
   ssize_t len = recv(c->sock, c->rbuf + c->rsize, c->rcap - c->rsize, 0);
   if (len < 0)
     die_sys("cannot recv from %u", c->id);
-  if (!len)
-    die("was disconnected by %u", c->id);
+  if (!len) {
+    if (self_num_pieces != num_pieces)
+      die("was disconnected by %u without the complete file", c->id);
+    exit(0);
+  }
   c->rsize += len;
   char *next = c->rbuf, *cur;
   while (c->rsize >= c->rwant) {
@@ -593,15 +586,13 @@ reselect_preferred_neighbors(void)
   strcpy(buf, "(none)");
   for (int i = 0; i < conn_count; ++i) {
     c = board[i];
-    if (c->flags & CONN_SHUT)
-      continue;
     c->rrate = 0;
-    if (i < num_preferred_neighbors) {
+    if (i < count && i < num_preferred_neighbors) {
+      if (len < sizeof(buf))
+        len += snprintf(buf + len, sizeof(buf) - len, i ? ", %u" : "%u", board[i]->id);
       if (!(c->flags & CONN_WFLOW))
         conn_write_header(c, 0, P2P_UNCHOKE);
       c->flags |= CONN_WPREF;
-      if (len < sizeof(buf))
-        len += snprintf(buf + len, sizeof(buf) - len, i ? ", %u" : "%u", board[i]->id);
     } else {
       if ((c->flags & CONN_WFLOW) == CONN_WPREF)
         conn_write_header(c, 0, P2P_CHOKE);
@@ -714,12 +705,11 @@ loop:
     t2 = optimistic_unchoking_interval;
   }
   prev_time = cur_time;
-  int done = 1;
+  int done = self_num_pieces == num_pieces;
   for (c = conn_head, pfd = pfds; c; c = c->next, ++pfd) {
     pfd->fd = c->sock;
     pfd->events = c->wsize ? (POLLOUT | POLLIN) : POLLIN;
-    if (!(c->flags & CONN_SHUT) || c->wsize)
-      done = 0;
+    done = done && c->num_pieces == num_pieces;
   }
   if (done) {
     return 0;
