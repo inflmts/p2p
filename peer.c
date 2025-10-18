@@ -1,4 +1,3 @@
-#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -12,7 +11,6 @@
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -38,24 +36,23 @@ static unsigned int the_file_size;
 static unsigned int piece_size = 16384;
 static unsigned int num_pieces;
 static unsigned int bitfield_size;
-static unsigned char bitfield_tailmask;
 
 static unsigned int self_id;
 static int self_sock = -1;
-static unsigned char *self_bitfield;
+static unsigned char *self_have, *self_pend;
 static unsigned int self_num_pieces;
 static int logfd = -1;
 static char *the_file = MAP_FAILED;
 
 static void __attribute__((format(printf, 1, 2)))
-shit(const char *format, ...)
+msg(const char *format, ...)
 {
   va_list ap;
-  char buf[2048], *s = buf;
+  char buf[2048], *s;
   struct timespec ts;
   clock_gettime(CLOCK_REALTIME, &ts);
   struct tm *tm = localtime(&ts.tv_sec);
-  s += sprintf(buf, "%04d-%02d-%02d %02d:%02d:%02d.%06d: Peer %u ",
+  s = buf + sprintf(buf, "%04d-%02d-%02d %02d:%02d:%02d.%06d: Peer %u ",
       tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
       tm->tm_hour, tm->tm_min, tm->tm_sec, (int)ts.tv_nsec / 1000, self_id);
   va_start(ap, format);
@@ -69,7 +66,7 @@ shit(const char *format, ...)
   write(logfd, buf, s - buf);
 }
 
-#define err(...) shit(__VA_ARGS__)
+#define err(...) msg(__VA_ARGS__)
 #define err_sys_(format, ...) err(format ": %s", __VA_ARGS__)
 #define err_sys(...) err_sys_(__VA_ARGS__, strerror(errno))
 #define die(...) err(__VA_ARGS__), exit(1)
@@ -106,7 +103,7 @@ read_uint32(const void *buf)
 struct conn
 {
   struct conn *next;
-  unsigned char *bitfield;
+  unsigned char *have;
   char *wbuf;
   char *rbuf;
   int sock;
@@ -128,14 +125,6 @@ static struct conn *conn_head;
 static int conn_count;
 static struct conn **board;
 static struct conn *conn_wopt;
-
-static void
-conn_shutdown(struct conn *c)
-{
-  c->flags |= CONN_SHUT;
-  if (!c->wsize)
-    shutdown(c->sock, SHUT_WR);
-}
 
 static void
 conn_write(struct conn *c, const void *buf, unsigned int size)
@@ -164,24 +153,22 @@ conn_write_header(struct conn *c, uint32_t len, unsigned char type)
 }
 
 static void
-conn_request_any(struct conn *c)
+conn_request(struct conn *c)
 {
-  unsigned int off = (unsigned int)mrand48();
-  for (unsigned int i = 0; i < num_pieces; ++i) {
-    unsigned int index = (i + off) % num_pieces;
-    unsigned char mask = 128 >> (index & 7);
-    if (!(c->bitfield[index >> 3] & ~self_bitfield[index >> 3] & mask))
-      continue;
-    /* don't send already requested */
-    for (struct conn *o = conn_head; o; o = o->next)
-      if (o->flags & CONN_REQ && o->req == index)
-        continue;
-    conn_write_header(c, 4, P2P_REQUEST);
-    conn_write_uint32(c, index);
-    c->flags |= CONN_REQ;
-    c->req = index;
+  if (!(c->flags & CONN_RFLOW) || !c->num_want || c->flags & CONN_REQ)
     return;
-  }
+  unsigned int index = (unsigned int)mrand48() % num_pieces;
+  unsigned char mask;
+  while (!(c->have[index >> 3] & ~self_pend[index >> 3] & (mask = 128 >> (index & 7))))
+    index = (index + 1) % num_pieces;
+  self_pend[index >> 3] |= mask;
+  conn_write_header(c, 4, P2P_REQUEST);
+  conn_write_uint32(c, index);
+  c->flags |= CONN_REQ;
+  c->req = index;
+  for (c = conn_head; c; c = c->next)
+    if ((c->have[index >> 3] & mask) && !--c->num_want)
+      conn_write_header(c, 0, P2P_NOINT);
 }
 
 static void
@@ -192,50 +179,45 @@ conn_read_have(struct conn *c, char *buf)
     die("received invalid 'have' for %u (max is %u) from %u.",
         index, num_pieces - 1, c->id);
   }
-  shit("received the 'have' message from %u for the piece %u.", c->id, index);
   unsigned char mask = 128 >> (index & 7);
-  if (c->bitfield[index >> 3] & mask) {
-    return;
+  if (c->have[index >> 3] & mask) {
+    die("received duplicate 'have' from %u for piece %u.", c->id, index);
   }
-  c->bitfield[index >> 3] |= mask;
+  msg("received the 'have' message from %u for the piece %u.", c->id, index);
+  c->have[index >> 3] |= mask;
   ++c->num_pieces;
-  if (!(self_bitfield[index >> 3] & mask) && !c->num_want++) {
+  if (!(self_pend[index >> 3] & mask) && !c->num_want++) {
     conn_write_header(c, 0, P2P_INT);
-    if (c->flags & CONN_WFLOW) {
-      conn_request_any(c);
-    }
+    conn_request(c);
   }
   if (c->num_pieces == num_pieces && self_num_pieces == num_pieces) {
-    conn_shutdown(c);
+    c->flags |= CONN_SHUT;
   }
 }
 
 static void
 conn_read_bitfield(struct conn *c, char *buf)
 {
-  memcpy(c->bitfield, buf, bitfield_size);
-  if (bitfield_tailmask)
-    c->bitfield[bitfield_size - 1] &= bitfield_tailmask;
+  /* TODO */
+  memcpy(c->have, buf, bitfield_size);
   c->num_pieces = 0;
   c->num_want = 0;
   for (unsigned int index = 0; index < num_pieces; ++index) {
     unsigned char mask = 128 >> (index & 7);
-    if (!(c->bitfield[index >> 3] & mask))
+    if (!(c->have[index >> 3] & mask))
       continue;
     ++c->num_pieces;
-    if (!(self_bitfield[index >> 3] & mask))
+    if (!(self_pend[index >> 3] & mask))
       ++c->num_want;
   }
   if (c->num_want) {
     conn_write_header(c, 0, P2P_INT);
-    if (c->flags & CONN_WFLOW) {
-      conn_request_any(c);
-    }
+    conn_request(c);
   } else {
     conn_write_header(c, 0, P2P_NOINT);
   }
   if (c->num_pieces == num_pieces && self_num_pieces == num_pieces)
-    conn_shutdown(c);
+    c->flags |= CONN_SHUT;
 }
 
 static void
@@ -246,14 +228,14 @@ conn_read_request(struct conn *c, char *buf)
     return; /* choked */
   }
   if (index >= num_pieces) {
-    die("received invalid request for %u (max is %u) from %u.",
-        index, num_pieces - 1, c->id);
+    die("received invalid request for %u from %u (max is %u)",
+        index, c->id, num_pieces - 1);
   }
   unsigned int offset = index * piece_size;
   unsigned int size = index == num_pieces - 1 ? the_file_size - offset : piece_size;
-  /* TODO: instrument read */
   conn_write_header(c, 4 + size, P2P_PIECE);
   conn_write_uint32(c, index);
+  /* read piece from file */
   conn_write(c, the_file + offset, size);
 }
 
@@ -262,36 +244,32 @@ conn_read_piece(struct conn *c, char *buf)
 {
   uint32_t index = read_uint32(buf);
   if (index >= num_pieces) {
-    die("received invalid piece %u (max is %u) from %u.",
-        index, num_pieces - 1, c->id);
+    die("received invalid piece %u from %u (max is %u)",
+        index, c->id, num_pieces - 1);
   }
+  if (!(c->flags & CONN_REQ) || c->req != index) {
+    return; /* discard */
+  }
+  unsigned int offset = index * piece_size;
+  unsigned int size = index == num_pieces - 1 ? the_file_size - offset : piece_size;
+  /* write piece to file */
+  memcpy(the_file + offset, buf + 4, size);
   c->flags &= ~CONN_REQ;
-  unsigned char mask = 1 << (7 - (index & 7));
-  if (!(self_bitfield[index >> 3] & mask)) {
-    unsigned int offset = index * piece_size;
-    unsigned int size = index == num_pieces - 1 ? the_file_size - offset : piece_size;
-    c->rrate += size;
-    /* TODO: instrument write */
-    memcpy(the_file + offset, buf + 4, size);
-    self_bitfield[index >> 3] |= mask;
-    ++self_num_pieces;
-    shit("has downloaded the piece %u from %u. "
-           "Now the number of pieces it has is %u.",
-           index, c->id, self_num_pieces);
-    if (self_num_pieces == num_pieces) {
-      shit("has downloaded the complete file.");
-    }
-    for (struct conn *o = conn_head; o; o = o->next) {
-      conn_write_header(o, 4, P2P_HAVE);
-      conn_write_uint32(o, index);
-      if (o->num_want && (o->bitfield[index >> 3] & mask) && !--o->num_want)
-        conn_write_header(o, 0, P2P_NOINT);
-      if (o->num_pieces == num_pieces && self_num_pieces == num_pieces)
-        conn_shutdown(o);
-    }
+  c->rrate += size;
+  self_have[index >> 3] |= 128 >> (index & 7);
+  ++self_num_pieces;
+  msg("has downloaded the piece %u from %u. "
+      "Now the number of pieces it has is %u.",
+      index, c->id, self_num_pieces);
+  if (self_num_pieces == num_pieces) {
+    msg("has downloaded the complete file.");
   }
-  if (c->num_want && (c->flags & CONN_RFLOW)) {
-    conn_request_any(c);
+  conn_request(c);
+  for (c = conn_head; c; c = c->next) {
+    conn_write_header(c, 4, P2P_HAVE);
+    conn_write_uint32(c, index);
+    if (c->num_pieces == num_pieces && self_num_pieces == num_pieces)
+      c->flags |= CONN_SHUT;
   }
 }
 
@@ -304,29 +282,41 @@ conn_read_message(struct conn *c, char *buf)
       if (len != 1) {
         die("received 'choke' length %u, expected 1", len);
       }
-      shit("is choked by %u.", c->id);
-      c->flags &= ~(CONN_RFLOW | CONN_REQ);
+      msg("is choked by %u.", c->id);
+      c->flags &= ~CONN_RFLOW;
+      if (c->flags & CONN_REQ) {
+        c->flags &= ~CONN_REQ;
+        unsigned char mask = 128 >> (c->req & 7);
+        self_pend[c->req >> 3] &= ~mask;
+        for (c = conn_head; c; c = c->next) {
+          if ((c->have[c->req >> 3] & mask) && !c->num_want++) {
+            conn_write_header(c, 0, P2P_INT);
+            conn_request(c);
+            break;
+          }
+        }
+      }
       break;
     case P2P_UNCHOKE:
       if (len != 1) {
         die("received 'unchoke' length %u, expected 1", len);
       }
-      shit("is unchoked by %u.", c->id);
+      msg("is unchoked by %u.", c->id);
       c->flags |= CONN_RFLOW;
-      conn_request_any(c);
+      conn_request(c);
       break;
     case P2P_INT:
       if (len != 1) {
         die("received 'interested' length %u, expected 1", len);
       }
-      shit("received the 'interested' message from %u.", c->id);
+      msg("received the 'interested' message from %u.", c->id);
       c->flags |= CONN_WINT;
       break;
     case P2P_NOINT:
       if (len != 1) {
         die("received 'not interested' length %u, expected 1", len);
       }
-      shit("received the 'not interested' message from %u.", c->id);
+      msg("received the 'not interested' message from %u.", c->id);
       c->flags &= ~CONN_WINT;
       break;
     case P2P_HAVE:
@@ -369,21 +359,18 @@ conn_read_handshake(struct conn *c, char *buf)
     die("received invalid handshake from %u", c->id);
   }
   conn_write_header(c, bitfield_size, P2P_BITFIELD);
-  conn_write(c, self_bitfield, bitfield_size);
+  conn_write(c, self_have, bitfield_size);
 }
 
 static void
 conn_handle_write(struct conn *c)
 {
   ssize_t len = send(c->sock, c->wbuf, c->wsize, 0);
-  if (len < 0) {
+  if (len < 0)
     die_sys("cannot send to %u", c->id);
-  }
   c->wsize -= len;
   if (c->wsize)
     memmove(c->wbuf, c->wbuf + len, c->wsize);
-  else if (c->flags & CONN_SHUT)
-    shutdown(c->sock, SHUT_WR);
 }
 
 static void
@@ -393,15 +380,10 @@ conn_handle_read(struct conn *c)
     c->rbuf = realloc(c->rbuf, (c->rcap = c->rwant));
   }
   ssize_t len = recv(c->sock, c->rbuf + c->rsize, c->rcap - c->rsize, 0);
-  if (len < 0) {
+  if (len < 0)
     die_sys("cannot recv from %u", c->id);
-  }
-  if (!len) {
-    if (!(c->flags & CONN_SHUT))
-      die("was closed unexpectedly from %u", c->id);
-    c->rwant = 0;
-    return;
-  }
+  if (!len)
+    die("was disconnected by %u", c->id);
   c->rsize += len;
   char *next = c->rbuf, *cur;
   while (c->rsize >= c->rwant) {
@@ -424,7 +406,7 @@ static void
 conn_add(int sock, unsigned int id)
 {
   struct conn *c = calloc(1, sizeof(struct conn));
-  c->bitfield = calloc(1, bitfield_size);
+  c->have = calloc(1, bitfield_size);
   c->wbuf = malloc(32);
   c->rbuf = malloc(32);
   c->sock = sock;
@@ -456,7 +438,7 @@ conn_bind(uint16_t port, int has_file)
   setsockopt(self_sock, IPPROTO_IPV6, IPV6_V6ONLY, &cero, sizeof(cero));
   setsockopt(self_sock, SOL_SOCKET, SO_REUSEADDR, &uno, sizeof(uno));
   if (bind(self_sock, (const struct sockaddr *)&addr, sizeof(addr)))
-    die_sys("failed to bind to port %u", (unsigned int)port);
+    die_sys("cannot bind to port %u", (unsigned int)port);
   if (listen(self_sock, 16))
     die_sys("cannot listen");
 
@@ -486,18 +468,12 @@ conn_bind(uint16_t port, int has_file)
     die_sys("failed to mmap '%s'", filename);
   close(the_fd);
 
-  const char *env = getenv("P2P_NOTIFY_FD");
-  if (env && *env) {
-    int fd = atoi(env);
-    write(fd, &cero, 1);
-    close(fd);
-  }
-
-  self_bitfield = calloc(1, bitfield_size);
+  self_have = calloc(2, bitfield_size);
+  self_pend = self_have + bitfield_size;
   if (has_file) {
-    memset(self_bitfield, -1, bitfield_size);
-    if (bitfield_tailmask)
-      self_bitfield[bitfield_size - 1] = bitfield_tailmask;
+    memset(self_have, -1, bitfield_size * 2);
+    if (num_pieces & 7)
+      self_have[bitfield_size - 1] = ~(0xff >> (num_pieces & 7));
     self_num_pieces = num_pieces;
   }
 }
@@ -520,7 +496,7 @@ conn_connect(const char *host, uint16_t port, unsigned int id)
     }
     sock = socket(ai->ai_family, SOCK_STREAM, 0);
     if (sock == -1)
-      die_sys("failed to create socket");
+      die_sys("cannot create socket");
     if (!connect(sock, ai->ai_addr, ai->ai_addrlen))
       goto success;
     close(sock);
@@ -528,7 +504,7 @@ conn_connect(const char *host, uint16_t port, unsigned int id)
   die_sys("failed to connect to %s port %u", host, (unsigned int)port);
 success:
   freeaddrinfo(ai_head);
-  shit("makes a connection to Peer %u.", id);
+  msg("makes a connection to Peer %u.", id);
   conn_add(sock, id);
 }
 
@@ -538,7 +514,7 @@ conn_accept(unsigned int id)
   int sock = accept(self_sock, NULL, NULL);
   if (sock == -1)
     die_sys("cannot accept");
-  shit("is connected from Peer %u.", id);
+  msg("is connected from Peer %u.", id);
   conn_add(sock, id);
 }
 
@@ -632,7 +608,7 @@ reselect_preferred_neighbors(void)
       c->flags &= ~CONN_WPREF;
     }
   }
-  shit("has the preferred neighbors %s.", buf);
+  msg("has the preferred neighbors %s.", buf);
 }
 
 static void
@@ -653,7 +629,7 @@ optimistic_unchoke_neighbor(void)
     conn_wopt = c = board[(unsigned int)mrand48() % count];
     conn_write_header(c, 0, P2P_UNCHOKE);
     c->flags |= CONN_WOPT;
-    shit("has the optimistically unchoked neighbor %u.", c->id);
+    msg("has the optimistically unchoked neighbor %u.", c->id);
   }
 }
 
@@ -690,7 +666,6 @@ config_load(const char *filename)
   optimistic_unchoking_interval *= 1000;
   num_pieces = (the_file_size + piece_size - 1) / piece_size;
   bitfield_size = (num_pieces + 7) >> 3;
-  bitfield_tailmask = ~(255 >> (num_pieces & 7));
 }
 
 int main(int argc, char **argv)
@@ -724,41 +699,41 @@ int main(int argc, char **argv)
   struct conn *c;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   prev_time = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-  srand48(prev_time);
+  srand48(prev_time + self_id);
   pfds = calloc(conn_count, sizeof(*pfds));
 
-  while (1) {
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    cur_time = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-    if ((t1 -= cur_time - prev_time) > unchoking_interval) {
-      reselect_preferred_neighbors();
-      t1 = unchoking_interval;
-    }
-    if ((t2 -= cur_time - prev_time) > optimistic_unchoking_interval) {
-      optimistic_unchoke_neighbor();
-      t2 = optimistic_unchoking_interval;
-    }
-    prev_time = cur_time;
-    int done = 1;
-    for (c = conn_head, pfd = pfds; c; c = c->next, ++pfd) {
-      pfd->events = (c->wsize ? POLLOUT : 0) | (c->rwant ? POLLIN : 0);
-      pfd->fd = pfd->events ? c->sock : -1;
-      if (pfd->fd != -1)
-        done = 0;
-    }
-    if (done)
-      break;
-    if (poll(pfds, conn_count, (t1 < t2 ? t1 : t2) + 1) < 0)
-      die_sys("cannot poll");
-    for (c = conn_head, pfd = pfds; c; c = c->next, ++pfd) {
-      if (!pfd->revents)
-        continue;
-      if (pfd->revents & POLLOUT)
-        conn_handle_write(c);
-      if (pfd->revents & ~POLLOUT)
-        conn_handle_read(c);
-    }
+loop:
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  cur_time = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+  if ((t1 -= cur_time - prev_time) > unchoking_interval) {
+    reselect_preferred_neighbors();
+    t1 = unchoking_interval;
   }
-
-  return 0;
+  if ((t2 -= cur_time - prev_time) > optimistic_unchoking_interval) {
+    optimistic_unchoke_neighbor();
+    t2 = optimistic_unchoking_interval;
+  }
+  prev_time = cur_time;
+  int done = 1;
+  for (c = conn_head, pfd = pfds; c; c = c->next, ++pfd) {
+    pfd->fd = c->sock;
+    pfd->events = c->wsize ? (POLLOUT | POLLIN) : POLLIN;
+    if (!(c->flags & CONN_SHUT) || c->wsize)
+      done = 0;
+  }
+  if (done) {
+    return 0;
+  }
+  if (poll(pfds, conn_count, (t1 < t2 ? t1 : t2) + 1) < 0) {
+    die_sys("cannot poll");
+  }
+  for (c = conn_head, pfd = pfds; c; c = c->next, ++pfd) {
+    if (!pfd->revents)
+      continue;
+    if (pfd->revents & POLLOUT)
+      conn_handle_write(c);
+    if (pfd->revents & ~POLLOUT)
+      conn_handle_read(c);
+  }
+  goto loop;
 }
