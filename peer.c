@@ -1,18 +1,35 @@
 #include <errno.h>
 #include <fcntl.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <poll.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
-#include <sys/socket.h>
 #include <sys/stat.h>
 #include <time.h>
-#include <unistd.h>
+
+#ifndef _WIN32
+# include <netdb.h>
+# include <netinet/in.h>
+# include <poll.h>
+# include <sys/mman.h>
+# include <sys/socket.h>
+# include <unistd.h>
+#else
+# include <io.h>
+# include <winsock2.h>
+# include <ws2tcpip.h>
+# define mkdir(path, mode) mkdir(path)
+# define fcntl(...) ((void)0)
+# define ftruncate(...) chsize(__VA_ARGS__)
+# define poll(...) WSAPoll(__VA_ARGS__)
+# define MAP_FAILED NULL
+# define PROT_READ 1
+# define PROT_WRITE 2
+# define mmap(...) NULL
+# define mrand48() rand()
+# define srand48(seed) srand(seed)
+#endif
 
 #define P2P_CHOKE     0
 #define P2P_UNCHOKE   1
@@ -426,8 +443,8 @@ conn_bind(uint16_t port, int has_file)
   self_sock = socket(AF_INET6, SOCK_STREAM, 0);
   if (self_sock == -1)
     die_sys("cannot create server socket");
-  setsockopt(self_sock, IPPROTO_IPV6, IPV6_V6ONLY, &cero, sizeof(cero));
-  setsockopt(self_sock, SOL_SOCKET, SO_REUSEADDR, &uno, sizeof(uno));
+  setsockopt(self_sock, IPPROTO_IPV6, IPV6_V6ONLY, (const void *)&cero, sizeof(cero));
+  setsockopt(self_sock, SOL_SOCKET, SO_REUSEADDR, (const void *)&uno, sizeof(uno));
   if (bind(self_sock, (const struct sockaddr *)&addr, sizeof(addr)))
     die_sys("cannot bind to port %u", (unsigned int)port);
   if (listen(self_sock, 16))
