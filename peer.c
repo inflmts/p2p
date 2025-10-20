@@ -1,18 +1,28 @@
 #include <errno.h>
 #include <fcntl.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <poll.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
-#include <sys/socket.h>
 #include <sys/stat.h>
 #include <time.h>
-#include <unistd.h>
+
+#ifndef _WIN32
+# include <netdb.h>
+# include <netinet/in.h>
+# include <poll.h>
+# include <sys/mman.h>
+# include <sys/socket.h>
+# include <unistd.h>
+#else
+# include <io.h>
+# include <winsock2.h>
+# include <ws2tcpip.h>
+# define mkdir(path, mode) mkdir(path)
+# define ftruncate(...) chsize(__VA_ARGS__)
+# define poll(...) WSAPoll(__VA_ARGS__)
+#endif
 
 #define P2P_CHOKE     0
 #define P2P_UNCHOKE   1
@@ -42,7 +52,7 @@ static int self_sock = -1;
 static unsigned char *self_have, *self_pend;
 static unsigned int self_num_pieces;
 static int logfd = -1;
-static char *the_file = MAP_FAILED;
+static char *the_file;
 
 static void __attribute__((format(printf, 1, 2)))
 msg(const char *format, ...)
@@ -156,7 +166,7 @@ conn_request(struct conn *c)
 {
   if (!(c->flags & CONN_RFLOW) || !c->num_want || c->flags & CONN_REQ)
     return;
-  unsigned int index = (unsigned int)mrand48() % num_pieces;
+  unsigned int index = (unsigned int)rand() % num_pieces;
   unsigned char mask;
   while (!(c->have[index >> 3] & ~self_pend[index >> 3] & (mask = 128 >> (index & 7))))
     index = (index + 1) % num_pieces;
@@ -412,7 +422,9 @@ conn_add(int sock, unsigned int id)
   /* send handshake */
   conn_write(c, magic, sizeof(magic));
   conn_write_uint32(c, self_id);
+#ifndef _WIN32
   fcntl(sock, F_SETFL, O_NONBLOCK);
+#endif
 }
 
 static void
@@ -426,8 +438,8 @@ conn_bind(uint16_t port, int has_file)
   self_sock = socket(AF_INET6, SOCK_STREAM, 0);
   if (self_sock == -1)
     die_sys("cannot create server socket");
-  setsockopt(self_sock, IPPROTO_IPV6, IPV6_V6ONLY, &cero, sizeof(cero));
-  setsockopt(self_sock, SOL_SOCKET, SO_REUSEADDR, &uno, sizeof(uno));
+  setsockopt(self_sock, IPPROTO_IPV6, IPV6_V6ONLY, (const void *)&cero, sizeof(cero));
+  setsockopt(self_sock, SOL_SOCKET, SO_REUSEADDR, (const void *)&uno, sizeof(uno));
   if (bind(self_sock, (const struct sockaddr *)&addr, sizeof(addr)))
     die_sys("cannot bind to port %u", (unsigned int)port);
   if (listen(self_sock, 16))
@@ -453,11 +465,19 @@ conn_bind(uint16_t port, int has_file)
   } else if (ftruncate(the_fd, the_file_size)) {
     die_sys("could not truncate '%s' to %u bytes", filename, the_file_size);
   }
+
+#ifndef _WIN32
   int prot = has_file ? PROT_READ : PROT_READ | PROT_WRITE;
   the_file = mmap(NULL, the_file_size, prot, MAP_SHARED, the_fd, 0);
   if (the_file == MAP_FAILED)
     die_sys("failed to mmap '%s'", filename);
   close(the_fd);
+#else
+  int prot = has_file ? FILE_MAP_READ : FILE_MAP_READ | FILE_MAP_WRITE;
+  HANDLE fm = CreateFileMapping((HANDLE)_get_osfhandle(the_fd), NULL, prot, 0, the_file_size, NULL);
+  the_file = MapViewOfFile(fm, prot, 0, 0, the_file_size);
+  CloseHandle(fm);
+#endif
 
   self_have = calloc(2, bitfield_size);
   self_pend = self_have + bitfield_size;
@@ -567,7 +587,7 @@ reselect_preferred_neighbors(void)
   if (count) {
     /* https://en.wikipedia.org/wiki/Fisher-Yates_shuffle */
     for (int i = count - 1; i > 0; --i) {
-      int j = (unsigned int)mrand48() % (i + 1);
+      int j = (unsigned int)rand() % (i + 1);
       if (i != j) {
         c = board[i];
         board[i] = board[j];
@@ -615,7 +635,7 @@ optimistic_unchoke_neighbor(void)
     conn_wopt = NULL;
   }
   if (count) {
-    conn_wopt = c = board[(unsigned int)mrand48() % count];
+    conn_wopt = c = board[(unsigned int)rand() % count];
     conn_write_header(c, 0, P2P_UNCHOKE);
     c->flags |= CONN_WOPT;
     msg("has the optimistically unchoked neighbor %u.", c->id);
@@ -688,7 +708,7 @@ int main(int argc, char **argv)
   struct conn *c;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   prev_time = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-  srand48(prev_time + self_id);
+  srand(prev_time + self_id);
   pfds = calloc(conn_count, sizeof(*pfds));
 
 loop:

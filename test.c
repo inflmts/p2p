@@ -55,7 +55,7 @@ int main(int argc, char **argv)
 
   /* launch peer processes */
   char arg[32];
-  char *args[3] = { "peer", arg, NULL };
+  char *args[3] = { "peer.exe", arg, NULL };
   for (int i = 0; i < num_peers; ++i) {
     pid = fork();
     if (pid < 0) {
@@ -68,7 +68,7 @@ int main(int argc, char **argv)
       nanosleep(&ts, NULL);
       sprintf(arg, "%d", ids[i]);
       msg("[starting peer %d]", ids[i]);
-      execve("peer", args, environ);
+      execve("peer.exe", args, environ);
       fatal("failed to execute peer process %d", ids[i]);
     }
     pids[i] = pid;

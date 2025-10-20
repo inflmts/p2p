@@ -1,6 +1,5 @@
 /peer_*/
 *.cfg
 *.log
-/peer
-*.out
+*.exe
 *.tar

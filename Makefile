@@ -1,15 +1,21 @@
 .PHONY: dist test
 
-peer: peer.c
-	gcc -Wall -Werror -o $@ $<
+ifneq ($(OS),Windows_NT)
+CFLAGS := -Wall -Werror
+else
+CFLAGS := -Wall -Werror -lws2_32
+endif
+
+peer.exe: peer.c
+	gcc -o $@ $< $(CFLAGS)
 
 dist: proj1.tar
 
 proj1.tar: README.md Makefile peer.c
 	tar -cvf $@ $^
 
-test: test.out peer
-	./test.out
+test: test.exe peer.exe
+	./test.exe
 
-test.out: test.c
-	gcc -Wall -Werror -o $@ $<
+test.exe: test.c
+	gcc -o $@ $< $(CFLAGS)
