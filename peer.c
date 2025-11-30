@@ -61,6 +61,9 @@ static unsigned int self_num_pieces;
 static int logfd = -1;
 static char *the_file = MAP_FAILED;
 
+//globals for checking full list
+static unsigned int *expected_peer_ids = NULL;
+static int expected_peer_count = 0;
 
 
 static void __attribute__((format(printf, 1, 2)))
@@ -160,6 +163,38 @@ static struct conn *conn_head;
 static int conn_count;
 static struct conn **board;
 static struct conn *conn_wopt;
+static int board_cap = 0; //capacity of board
+
+static void
+conn_close(struct conn *c)
+{
+    if (!c) return;
+    msg("closing connection to peer %u (fd %d)", c->id, c->sock);
+
+#ifdef _WIN32
+    closesocket(c->sock);
+#else
+    close(c->sock);
+#endif
+
+    /* remove from linked list */
+    if (conn_head == c) {
+        conn_head = c->next;
+    } else {
+        struct conn *p = conn_head;
+        while (p && p->next != c) p = p->next;
+        if (p) p->next = c->next;
+    }
+
+    /* free resources */
+    free(c->have);
+    free(c->wbuf);
+    free(c->rbuf);
+
+    free(c);
+
+    --conn_count;
+}
 
 static void
 conn_write(struct conn *c, const void *buf, unsigned int size)
@@ -506,7 +541,9 @@ conn_handle_read(struct conn *c)
         int wsaerr = WSAGetLastError();
         msg("recv() would block/error %d on %u (rsize=%u, rwant=%u).", wsaerr, c->id, c->rsize, c->rwant);
         if (wsaerr == WSAEWOULDBLOCK) return;
-        die_sys("recv error on %u", c->id);
+        msg("recv error on %u: WSA error %d -- closing connection INSTEAD OF DYING", c->id, wsaerr);
+        conn_close(c);
+        return;
     }
     ssize_t len = rc;
 #else
@@ -576,6 +613,19 @@ conn_add(int sock, unsigned int id)
     c->next = conn_head;
     conn_head = c;
     ++conn_count;
+
+    //testing
+    if (conn_count > board_cap) {
+        int newcap = conn_count;
+        struct conn **tmp = realloc(board, newcap * sizeof(*board));
+        if (!tmp) die("realloc failed for board");
+        /* zero the newly allocated slots so the array is in a known state */
+        if (newcap > board_cap)
+            memset(tmp + board_cap, 0, (newcap - board_cap) * sizeof(*board));
+        board = tmp;
+        board_cap = newcap;
+    }
+
 
     msg("queued handshake to %u (will be sent when socket writable).", c->id);
 
@@ -665,8 +715,13 @@ conn_bind(uint16_t port, int has_file)
     self_pend = self_have + bitfield_size;
     if (has_file) {
         memset(self_have, 0xFF, bitfield_size);
-        if (num_pieces & 7)
-            self_have[bitfield_size - 1] = ~(0xFF >> (num_pieces & 7));
+
+        if (num_pieces & 7) { //check
+            unsigned int valid_bits = num_pieces & 7;
+            unsigned char mask = (unsigned char)(0xFF << (8 - valid_bits));
+            self_have[bitfield_size - 1] = mask;
+        }
+
         self_num_pieces = num_pieces;
     }
 }
@@ -726,6 +781,9 @@ conn_accept(void)
 static void
 conn_init(const char *filename)
 {
+    expected_peer_count = 0;
+    expected_peer_ids = NULL;
+
     char line[1024];
     FILE *f = fopen(filename, "r");
     if (!f) die_sys("could not open '%s'", filename);
@@ -743,11 +801,15 @@ conn_init(const char *filename)
             parse_pint(fprt, &port) || !port || port > 0xffff) {
             die("could not parse '%s'", filename);
         }
+        //not sure
+        unsigned int *tmp = realloc(expected_peer_ids, (expected_peer_count + 1) * sizeof(*expected_peer_ids));
+        if (!tmp) die("realloc failed for expected_peer_ids");
+        expected_peer_ids = tmp;
+        expected_peer_ids[expected_peer_count++] = id;
 
         if (id == self_id) {
             conn_bind(port, !strcmp(fhas, "1")); // bind/listen for self
         } else if (id < self_id) {
-            /* Only connect to peers that were listed before self (they have been started) */
             conn_connect(host, port, id);
         } else {
             //dont attempt all peers at once
@@ -759,7 +821,16 @@ conn_init(const char *filename)
     if (self_sock == -1)
         die("could not find self configuration");
 
-    board = calloc(conn_count, sizeof(*board));
+    //board = calloc(conn_count, sizeof(*board));
+    //testing:works
+    if (conn_count > 0) {
+        board = calloc(conn_count, sizeof(*board));
+        if (!board) die("calloc failed for board");
+        board_cap = conn_count;
+    } else {
+        board = NULL;
+        board_cap = 0;
+    }
 }
 
 static int
@@ -770,11 +841,24 @@ conn_ratecmp(const void *a, const void *b)
 static int
 all_peers_complete(void)
 {
-    struct conn *c;
     if (self_num_pieces != num_pieces) return 0;
-    for (c = conn_head; c; c = c->next) {
-        if (c->num_pieces != num_pieces) return 0;
+
+    for (int i = 0; i < expected_peer_count; ++i) {
+        unsigned int id = expected_peer_ids[i];
+        if (id == self_id) continue;
+
+        struct conn *c;
+        for (c = conn_head; c; c = c->next) {
+            if (c->id == (int)id) break;
+        }
+        if (!c) {
+            return 0;
+        }
+        if (c->num_pieces != num_pieces) {
+            return 0;
+        }
     }
+
     return 1;
 }
 
@@ -885,6 +969,8 @@ config_load(const char *filename)
   bitfield_size = (num_pieces + 7) >> 3;
 }
 
+
+
 int main(int argc, char **argv)
 {
 
@@ -929,21 +1015,55 @@ if (r != 0) {
   conn_init("PeerInfo.cfg");
 
 
-    /* NEW event loop */
+    //event loop
     struct timespec ts;
     unsigned int prev_time, cur_time, t1 = -1, t2 = -1;
-    struct pollfd *pfds, *pfd;
+    //struct pollfd *pfds, *pfd;
     struct conn *c;
 
     clock_gettime(CLOCK_MONOTONIC, &ts);
     prev_time = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
     srand48(prev_time + self_id);
 
-// IMPORTANT: allocate space for listener + all connections
-    free(pfds);
+// allocate space for listener and connections
+    struct pollfd *pfds = NULL, *pfd;
     pfds = calloc(conn_count + 1, sizeof(*pfds));
 
-    loop:
+
+    //accept connections before we are in loop
+    //still need to do something for leaving at the end
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    struct pollfd p;
+    p.fd = self_sock;
+    p.events = POLLIN;
+
+    while (1) {
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long elapsed =
+                (now.tv_sec - start.tv_sec) * 1000 +
+                (now.tv_nsec - start.tv_nsec) / 1000000;
+
+        if (elapsed > 1000)  // wait 1 second max
+            break;
+
+        int r = poll(&p, 1, 100);  // 100ms mini-poll
+
+        if (r > 0 && (p.revents & POLLIN)) {
+            conn_accept();
+        } else if (r < 0) {
+            break;
+        }
+    }
+//accept connections before loop
+
+
+
+
+
+loop:
+
     clock_gettime(CLOCK_MONOTONIC, &ts);
     cur_time = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 
@@ -963,8 +1083,16 @@ if (r != 0) {
     int done = all_peers_complete();
     if (done) {
         msg("all peers have the complete file; exiting.");
-        //return 0;
+        return 0;
     }
+
+// Not sure about this
+    size_t needed = (size_t)conn_count + 1;
+    struct pollfd *tmp = realloc(pfds, needed * sizeof(*pfds));
+    if (!tmp) die("realloc failed for pfds");
+    pfds = tmp;
+
+
 
 
     // ---- Build poll list ----
@@ -975,7 +1103,7 @@ if (r != 0) {
     pfds[nfds].events = POLLIN;
     nfds++;
 
-    // connection sockets
+    // connection sock
     for (c = conn_head; c; c = c->next) {
         pfds[nfds].fd = c->sock;
         pfds[nfds].events = c->wsize ? (POLLOUT | POLLIN) : POLLIN;
@@ -991,13 +1119,12 @@ if (r != 0) {
 
     if (n < 0) goto loop;
 
-    // ---- Accept inbound connections ----
     if (pfds[0].revents & POLLIN) {
-        //msg("listener socket READY, accepting inbound connection");
+        // listener socket READY, accepting inbound connection
         conn_accept();
     }
 
-    // ---- Handle connection sockets ----
+    // Handle connection sockets
     pfd = &pfds[1];  // skip listener
     for (c = conn_head; c; c = c->next, ++pfd) {
         if (!pfd->revents)
@@ -1005,12 +1132,12 @@ if (r != 0) {
 
         //msg("poll detected events %d on fd %d (peer %u)",pfd->revents, pfd->fd, c->id);
 
-        //read before write
-        if (pfd->revents & (POLLIN | POLLERR | POLLHUP))
-            conn_handle_read(c);
 
         if (pfd->revents & POLLOUT)
             conn_handle_write(c);
+
+        if (pfd->revents & (POLLIN | POLLERR | POLLHUP))
+            conn_handle_read(c);
 
     }
 
@@ -1018,5 +1145,8 @@ if (r != 0) {
 
 
 }
+
+
+
 
 
