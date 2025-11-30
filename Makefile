@@ -19,3 +19,10 @@ test: test.exe peer.exe
 
 test.exe: test.c
 	gcc -Wall -Werror -o $@ $<
+
+clean:
+ifeq ($(OS),Windows_NT)
+	del /Q peer.exe test.exe proj1.tar log_peer_*.log
+else
+	rm -f peer.exe test.exe *.o proj1.tar log_peer_*.log
+endif
