@@ -648,7 +648,6 @@ conn_add(int sock, unsigned int id)
 static void
 conn_bind(uint16_t port, int has_file)
 {
-    // 1. Create socket and listen first
     struct sockaddr_in6 addr = {0};
     addr.sin6_family = AF_INET6;
     addr.sin6_port = htons(port);
@@ -678,36 +677,46 @@ conn_bind(uint16_t port, int has_file)
 
     msg("Peer %u listening on port %u", self_id, port);
 
-    // 2. Now handle the file
+    // now handle the file
     char filename[1024];
     snprintf(filename, sizeof(filename), "peer_%u/%s", self_id, the_file_name);
 
-    FILE *f = fopen(filename, has_file ? "rb" : "wb+");
-    if (!f) die_sys("failed to open '%s'", filename);
+//#ifdef _WIN32
+    // --- Windows version ---
+    int fd = open(filename, has_file ? O_RDONLY : (O_RDWR | O_CREAT), 0666);
+    if (fd == -1) {
+        die_sys("failed to open '%s'", filename);
+    }
 
     if (!has_file) {
-        // create file of correct size
-        fseek(f, the_file_size - 1, SEEK_SET);
-        fputc(0, f);
-        fflush(f);
+        // Resize file to correct size
+        if (_chsize(fd, the_file_size) != 0) {
+            die_sys("failed to resize '%s'", filename);
+        }
     } else {
-        struct stat st;
-        if (stat(filename, &st) || st.st_size != the_file_size)
+        struct _stat st;
+        if (_fstat(fd, &st) || st.st_size != the_file_size) {
             die("expected '%s' to be %u bytes, got %lld",
                 filename, the_file_size, (long long)st.st_size);
+        }
     }
 
-    // 3. Allocate memory buffer
-    the_file = malloc(the_file_size);
-    if (!the_file) die("malloc failed");
+    DWORD mapProt = has_file ? PAGE_READONLY : PAGE_READWRITE;
+    HANDLE fm = CreateFileMapping((HANDLE)_get_osfhandle(fd),
+                                  NULL,
+                                  mapProt,
+                                  0,
+                                  the_file_size,
+                                  NULL);
+    if (!fm) die_sys("CreateFileMapping failed");
 
-    if (has_file) {
-        fread(the_file, 1, the_file_size, f);
-    }
+    DWORD viewProt = has_file ? FILE_MAP_READ : (FILE_MAP_READ | FILE_MAP_WRITE);
+    the_file = MapViewOfFile(fm, viewProt, 0, 0, the_file_size);
+    if (!the_file) die_sys("MapViewOfFile failed");
 
-    fclose(f);
+    CloseHandle(fm);
+    close(fd);
 
-    // 4. Initialize bitfield
     self_have = calloc(1, bitfield_size*2);
     if (!self_have) {
         die("calloc failed");
