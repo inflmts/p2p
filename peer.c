@@ -54,15 +54,15 @@ static unsigned int self_num_pieces;
 static int logfd = -1;
 static char *the_file;
 
-static void __attribute__((format(printf, 1, 2)))
-msg(const char *format, ...)
+__attribute__((format(printf, 1, 2)))
+static void msg(const char *format, ...)
 {
   va_list ap;
   char buf[2048], *s;
   struct timespec ts;
   clock_gettime(CLOCK_REALTIME, &ts);
   struct tm *tm = localtime(&ts.tv_sec);
-  s = buf + sprintf(buf, "%04d-%02d-%02d %02d:%02d:%02d.%06d: Peer %u ",
+  s = buf + sprintf(buf, "%04d-%02d-%02d %02d:%02d:%02d.%06d [%u] ",
       tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
       tm->tm_hour, tm->tm_min, tm->tm_sec, (int)ts.tv_nsec / 1000, self_id);
   va_start(ap, format);
@@ -82,8 +82,7 @@ msg(const char *format, ...)
 #define die(...) err(__VA_ARGS__), exit(1)
 #define die_sys(...) err_sys(__VA_ARGS__), exit(1)
 
-static int
-parse_pint(const char *s, unsigned int *dest)
+static int parse_pint(const char *s, unsigned int *dest)
 {
   unsigned int value = 0;
   while (*s >= '0' && *s <= '9')
@@ -94,8 +93,7 @@ parse_pint(const char *s, unsigned int *dest)
   return 0;
 }
 
-static uint32_t
-read_uint32(const void *buf)
+static uint32_t read_uint32(const void *buf)
 {
   uint32_t value;
   memcpy(&value, buf, sizeof(value));
@@ -135,8 +133,7 @@ static int conn_count;
 static struct conn **board;
 static struct conn *conn_wopt;
 
-static void
-conn_write(struct conn *c, const void *buf, unsigned int size)
+static void conn_write(struct conn *c, const void *buf, unsigned int size)
 {
   c->wsize += size;
   if (c->wcap < c->wsize) {
@@ -147,22 +144,19 @@ conn_write(struct conn *c, const void *buf, unsigned int size)
   memcpy(c->wbuf + c->wsize - size, buf, size);
 }
 
-static void
-conn_write_uint32(struct conn *c, uint32_t value)
+static void conn_write_uint32(struct conn *c, uint32_t value)
 {
   value = htonl(value);
   conn_write(c, &value, 4);
 }
 
-static void
-conn_write_header(struct conn *c, uint32_t len, unsigned char type)
+static void conn_write_header(struct conn *c, uint32_t len, unsigned char type)
 {
   conn_write_uint32(c, len + 1);
   conn_write(c, &type, 1);
 }
 
-static void
-conn_request(struct conn *c)
+static void conn_request(struct conn *c)
 {
   if (!(c->flags & CONN_RFLOW) || !c->num_want || c->flags & CONN_REQ)
     return;
@@ -180,8 +174,7 @@ conn_request(struct conn *c)
       conn_write_header(c, 0, P2P_NOINT);
 }
 
-static void
-conn_read_have(struct conn *c, char *buf)
+static void conn_read_have(struct conn *c, char *buf)
 {
   unsigned int index = read_uint32(buf);
   if (index >= num_pieces) {
@@ -201,8 +194,7 @@ conn_read_have(struct conn *c, char *buf)
   }
 }
 
-static void
-conn_read_bitfield(struct conn *c, char *buf)
+static void conn_read_bitfield(struct conn *c, char *buf)
 {
   /* TODO */
   memcpy(c->have, buf, bitfield_size);
@@ -224,8 +216,7 @@ conn_read_bitfield(struct conn *c, char *buf)
   }
 }
 
-static void
-conn_read_request(struct conn *c, char *buf)
+static void conn_read_request(struct conn *c, char *buf)
 {
   uint32_t index = read_uint32(buf);
   if (!(c->flags & CONN_WFLOW)) {
@@ -243,8 +234,7 @@ conn_read_request(struct conn *c, char *buf)
   conn_write(c, the_file + offset, size);
 }
 
-static void
-conn_read_piece(struct conn *c, char *buf)
+static void conn_read_piece(struct conn *c, char *buf)
 {
   uint32_t index = read_uint32(buf);
   if (index >= num_pieces) {
@@ -275,8 +265,7 @@ conn_read_piece(struct conn *c, char *buf)
   }
 }
 
-static void
-conn_read_message(struct conn *c, char *buf)
+static void conn_read_message(struct conn *c, char *buf)
 {
   uint32_t len = read_uint32(buf);
   switch (buf[4]) {
@@ -352,8 +341,7 @@ conn_read_message(struct conn *c, char *buf)
   }
 }
 
-static void
-conn_read_handshake(struct conn *c, char *buf)
+static void conn_read_handshake(struct conn *c, char *buf)
 {
   if (memcmp(magic, buf, 28) || read_uint32(buf + 28) != c->id) {
     die("received invalid handshake from %u", c->id);
@@ -362,8 +350,7 @@ conn_read_handshake(struct conn *c, char *buf)
   conn_write(c, self_have, bitfield_size);
 }
 
-static void
-conn_handle_write(struct conn *c)
+static void conn_handle_write(struct conn *c)
 {
   ssize_t len = send(c->sock, c->wbuf, c->wsize, 0);
   if (len < 0)
@@ -373,8 +360,7 @@ conn_handle_write(struct conn *c)
     memmove(c->wbuf, c->wbuf + len, c->wsize);
 }
 
-static void
-conn_handle_read(struct conn *c)
+static void conn_handle_read(struct conn *c)
 {
   if (c->rcap < c->rwant) {
     c->rbuf = realloc(c->rbuf, (c->rcap = c->rwant));
@@ -403,8 +389,7 @@ conn_handle_read(struct conn *c)
   }
 }
 
-static void
-conn_add(int sock, unsigned int id)
+static void conn_add(int sock, unsigned int id)
 {
   struct conn *c = calloc(1, sizeof(struct conn));
   c->have = calloc(1, bitfield_size);
@@ -427,8 +412,7 @@ conn_add(int sock, unsigned int id)
 #endif
 }
 
-static void
-conn_bind(uint16_t port, int has_file)
+static void conn_bind(uint16_t port, int has_file)
 {
   struct sockaddr_in6 addr = {
     .sin6_family = AF_INET6,
@@ -444,6 +428,8 @@ conn_bind(uint16_t port, int has_file)
     die_sys("cannot bind to port %u", (unsigned int)port);
   if (listen(self_sock, 16))
     die_sys("cannot listen");
+
+  msg("listening on port %u", port);
 
   char filename[1024];
   struct stat st;
@@ -489,8 +475,7 @@ conn_bind(uint16_t port, int has_file)
   }
 }
 
-static void
-conn_connect(const char *host, uint16_t port, unsigned int id)
+static void conn_connect(const char *host, uint16_t port, unsigned int id)
 {
   struct addrinfo *ai, *ai_head;
   struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM };
@@ -515,22 +500,20 @@ conn_connect(const char *host, uint16_t port, unsigned int id)
   die_sys("failed to connect to %s port %u", host, (unsigned int)port);
 success:
   freeaddrinfo(ai_head);
-  msg("makes a connection to Peer %u.", id);
+  msg("connected to %u", id);
   conn_add(sock, id);
 }
 
-static void
-conn_accept(unsigned int id)
+static void conn_accept(unsigned int id)
 {
   int sock = accept(self_sock, NULL, NULL);
   if (sock == -1)
     die_sys("cannot accept");
-  msg("is connected from Peer %u.", id);
+  msg("accepted connection from %u", id);
   conn_add(sock, id);
 }
 
-static void
-conn_init(const char *filename)
+static void conn_init(const char *filename)
 {
   char line[1024];
   FILE *f = fopen(filename, "r");
@@ -566,14 +549,12 @@ conn_init(const char *filename)
   board = calloc(conn_count, sizeof(*board));
 }
 
-static int
-conn_ratecmp(const void *a, const void *b)
+static int conn_ratecmp(const void *a, const void *b)
 {
   return (int)(*(struct conn **)b)->rrate - (*(struct conn **)a)->rrate;
 }
 
-static void
-reselect_preferred_neighbors(void)
+static void reselect_preferred_neighbors(void)
 {
   struct conn *c, **tail = board + conn_count;
   int count = 0;
@@ -617,11 +598,10 @@ reselect_preferred_neighbors(void)
       c->flags &= ~CONN_WPREF;
     }
   }
-  msg("has the preferred neighbors %s.", buf);
+  msg("preferred neighbors: %s", buf);
 }
 
-static void
-optimistic_unchoke_neighbor(void)
+static void optimistic_unchoke_neighbor(void)
 {
   struct conn *c;
   int count = 0;
@@ -638,12 +618,11 @@ optimistic_unchoke_neighbor(void)
     conn_wopt = c = board[(unsigned int)rand() % count];
     conn_write_header(c, 0, P2P_UNCHOKE);
     c->flags |= CONN_WOPT;
-    msg("has the optimistically unchoked neighbor %u.", c->id);
+    msg("optimistically unchoked neighbor: %u", c->id);
   }
 }
 
-static void
-config_load(const char *filename)
+static void config_load(const char *filename)
 {
   FILE *f = fopen(filename, "r");
   if (!f)
@@ -684,6 +663,15 @@ int main(int argc, char **argv)
     write(2, usage, sizeof(usage) - 1);
     return 2;
   }
+
+  msg("starting...");
+
+#ifdef _WIN32
+  WSADATA wsa_data;
+  if (WSAStartup(MAKEWORD(2, 2), &wsa_data)) {
+    die("WSAStartup failed");
+  }
+#endif
 
   char filename[1024];
 
