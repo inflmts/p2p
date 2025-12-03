@@ -227,9 +227,7 @@ conn_write_header(struct conn *c, uint32_t len, unsigned char type)
 }
 
 
-/* -------------------------
-   Message-sender helpers
-   ------------------------- */
+//sender helpers
 
 
 static void
@@ -455,38 +453,31 @@ conn_read_message(struct conn *c, char *buf)
 static void
 conn_read_handshake(struct conn *c, char *buf) //new read handshake
 {
-    // 1. Validate the 18-byte magic string
+    // string validation
     if (memcmp(buf, magic, 18) != 0) {
         die("Invalid handshake magic from fd %d", c->sock);
     }
 
-    // 2. Validate the 10 zero bytes
     for (int i = 18; i < 28; ++i) {
         if (buf[i] != 0) {
             die("Invalid handshake zero bytes from fd %d", c->sock);
         }
     }
 
-    // 3. Extract peer ID
     uint32_t remote_id = read_uint32(buf + 28);
 
-    // 4. If we don't know the ID yet (inbound connect), assign it
+    // assign id if unknown
     if (c->id == 0) {
         c->id = remote_id;
         msg("Peer %u is connected from Peer %u.", self_id, c->id);
     }
     else if (remote_id != c->id) {
-        // Outbound connection: ID MUST match expected remote ID
         die("Handshake remote ID mismatch: expected %u, got %u",
             c->id, remote_id);
     }
 
     msg("HANDSHAKE RECEIVED: Peer %u <-> Peer %u", self_id, c->id);
 
-    // 5. Transition state (if you use states)
-    //c->state = SESSION_ESTABLISHED; //NOT SURE IF RIGHT
-
-    // 6. Send bitfield ONLY if we have pieces
     if (self_num_pieces > 0) {
         conn_write_header(c, bitfield_size, P2P_BITFIELD);
         conn_write(c, self_have, bitfield_size);
@@ -570,7 +561,7 @@ conn_handle_read(struct conn *c)
     //msg("conn_handle_read: rsize now %u for %u (rcap=%u).", c->rsize, c->id, c->rcap);
 
 
-    /* parsing loop (your existing logic) */
+    //parsing loop
     char *next = c->rbuf, *cur;
     while (c->rsize >= c->rwant) {
         void (*on_read)(struct conn *c, char *buf) = c->on_read;
@@ -589,7 +580,7 @@ conn_handle_read(struct conn *c)
     }
 }
 
-//new conn add
+//conn add changes
 static struct conn *
 conn_add(int sock, unsigned int id)
 {
@@ -608,7 +599,7 @@ conn_add(int sock, unsigned int id)
 
 
 
-    c->rwant = 32;               /* expect handshake first */
+    c->rwant = 32;               //handshake first I think
     c->on_read = conn_read_handshake;
     c->next = conn_head;
     conn_head = c;
@@ -631,7 +622,7 @@ conn_add(int sock, unsigned int id)
 
     make_socket_nonblocking(sock);
 
-    /* send handshake */
+    //sending handshake logic
     conn_write(c, magic, sizeof(magic));
     conn_write_uint32(c, self_id);
 
@@ -682,7 +673,7 @@ conn_bind(uint16_t port, int has_file)
     snprintf(filename, sizeof(filename), "peer_%u/%s", self_id, the_file_name);
 
 //#ifdef _WIN32
-    // --- Windows version ---
+    // Just windows
     int fd = open(filename, has_file ? O_RDONLY : (O_RDWR | O_CREAT), 0666);
     if (fd == -1) {
         die_sys("failed to open '%s'", filename);
@@ -700,7 +691,7 @@ conn_bind(uint16_t port, int has_file)
                 filename, the_file_size, (long long)st.st_size);
         }
     }
-
+//mapping so you can actually see the file fixing hte hex 0 error
     DWORD mapProt = has_file ? PAGE_READONLY : PAGE_READWRITE;
     HANDLE fm = CreateFileMapping((HANDLE)_get_osfhandle(fd),
                                   NULL,
@@ -761,10 +752,9 @@ conn_connect(const char *host, uint16_t port, unsigned int id)
           goto success;
       close(sock);
   }
-    /* failed to connect to any address — log and continue instead of exiting */
     err("failed to connect to %s port %u: %s", host, (unsigned int)port, strerror(errno));
     freeaddrinfo(ai_head);
-    return; /* just return — the remote peer will connect to us when it starts */
+    return;
     success:
     freeaddrinfo(ai_head);
     msg("makes a connection to Peer %u.", id);
@@ -1004,7 +994,7 @@ if (r != 0) {
 
   char filename[1024];
 
-  /* open log file */
+  //log file opening
   snprintf(filename, sizeof(filename), "log_peer_%u.log", self_id);
   logfd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0666);
   if (logfd == -1)
@@ -1012,7 +1002,7 @@ if (r != 0) {
 
 
 
-  /* create the directory if necessary */
+  //directory creation
   snprintf(filename, sizeof(filename), "peer_%u", self_id);
   if (mkdir(filename, 0777) && errno != EEXIST)
     die_sys("failed to create directory '%s'", filename);
@@ -1104,7 +1094,7 @@ loop:
 
 
 
-    // ---- Build poll list ----
+    // polling list
     int nfds = 0;
 
     // listener socket at index 0
@@ -1119,7 +1109,7 @@ loop:
         nfds++;
     }
 
-    // ---- Poll ----
+    // poll
     int timeout = (t1 < t2 ? t1 : t2) + 1;
     int n = poll(pfds, nfds, timeout);
 
