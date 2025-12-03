@@ -1,3 +1,4 @@
+/peer
 /peer_*/
 *.cfg
 *.log

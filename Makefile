@@ -1,21 +1,17 @@
 .PHONY: dist test
 
-ifneq ($(OS),Windows_NT)
-CFLAGS := -Wall -Werror
+ifeq ($(OS),Windows_NT)
+peer.exe: peer.c
+	gcc -Wall -Werror -o $@ $< -lws2_32
 else
-CFLAGS := -Wall -Werror -lws2_32
+peer: peer.c
+	gcc -Wall -Werror -o $@ $<
+
+test: peer
+	./peer
 endif
 
-peer.exe: peer.c
-	gcc -o $@ $< $(CFLAGS)
+dist: dist.tar
 
-dist: proj1.tar
-
-proj1.tar: README.md Makefile peer.c
+dist.tar: README.md Makefile peer.c
 	tar -cvf $@ $^
-
-test: test.exe peer.exe
-	./test.exe
-
-test.exe: test.c
-	gcc -o $@ $< $(CFLAGS)
