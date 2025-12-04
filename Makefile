@@ -6,12 +6,12 @@ peer.exe: peer.c
 else
 peer: peer.c
 	gcc -Wall -Werror -o $@ $<
-
-test: peer
-	./peer
 endif
 
 dist: dist.tar
 
 dist.tar: README.md Makefile peer.c
 	tar -cvf $@ $^
+
+test: peer
+	cd work && ../peer

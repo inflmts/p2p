@@ -16,6 +16,7 @@
 # include <sys/socket.h>
 # include <unistd.h>
 # define closesocket(sock) close(sock)
+# define die_socket(...) die_sys(__VA_ARGS__)
 #else
 # include <io.h>
 # include <winsock2.h>
@@ -24,6 +25,7 @@
 # define mkdir(path, mode) mkdir(path)
 # define ftruncate(fd, size) chsize(fd, size)
 # define poll(pfds, n, t) WSAPoll(pfds, n, t)
+# define die_socket(...) die(__VA_ARGS__)
 #endif
 
 #define P2P_CHOKE     0
@@ -35,19 +37,12 @@
 #define P2P_REQUEST   6
 #define P2P_PIECE     7
 
-static const char magic[28] = "P2PFILESHARINGPROJ\0\0\0\0\0\0\0\0\0\0";
-static const char *config_delim = "\r\n ";
-static const int uno = 1;
-static const int cero = 0;
-
-static unsigned int num_preferred_neighbors = 3;
-static unsigned int unchoking_interval = 5;
-static unsigned int optimistic_unchoking_interval = 10;
-static char the_file_name[256] = "thefile";
-static unsigned int the_file_size;
-static unsigned int piece_size = 16384;
-static unsigned int num_pieces;
-static unsigned int bitfield_size;
+#define CONN_WINT   4
+#define CONN_RFLOW  8
+#define CONN_WPREF  32
+#define CONN_WOPT   64
+#define CONN_REQ    256
+#define CONN_WFLOW  (CONN_WPREF | CONN_WOPT)
 
 struct peerinfo
 {
@@ -57,9 +52,6 @@ struct peerinfo
   int has_file;
   char host[256];
 };
-
-static struct peerinfo *peerinfo;
-static int num_peers;
 
 struct ev_handler
 {
@@ -77,18 +69,9 @@ struct ev_timer
 
 struct conn;
 
-static struct pollfd *ev_pollfds;
-static struct ev_handler *ev_handlers;
-static struct ev_timer *ev_timers;
-static int ev_cap;
-static int ev_count;
-static int ev_timer_cap;
-static int ev_timer_count;
-static unsigned int current_time;
-static struct conn **board;
-
 struct peer
 {
+  struct peer *next;
   int id;
   int sock;
   int logfd;
@@ -99,13 +82,6 @@ struct peer
   struct peerinfo *next_info;
   struct conn *conn_head;
 };
-
-#define CONN_WINT   4
-#define CONN_RFLOW  8
-#define CONN_WPREF  32
-#define CONN_WOPT   64
-#define CONN_REQ    256
-#define CONN_WFLOW  (CONN_WPREF | CONN_WOPT)
 
 struct conn
 {
@@ -128,6 +104,34 @@ struct conn
   unsigned int req;
   void (*on_read)(struct conn *c, char *buf);
 };
+
+static const char magic[28] = "P2PFILESHARINGPROJ\0\0\0\0\0\0\0\0\0\0";
+static const char *config_delim = "\r\n ";
+static const int uno = 1;
+static const int cero = 0;
+
+static unsigned int num_preferred_neighbors = 3;
+static unsigned int unchoking_interval = 5;
+static unsigned int optimistic_unchoking_interval = 10;
+static char the_file_name[256] = "thefile";
+static unsigned int the_file_size;
+static unsigned int piece_size = 16384;
+static unsigned int num_pieces;
+static unsigned int bitfield_size;
+static struct peerinfo *peerinfo;
+static int num_peers;
+
+static struct pollfd *ev_pollfds;
+static struct ev_handler *ev_handlers;
+static struct ev_timer *ev_timers;
+static int ev_cap;
+static int ev_count;
+static int ev_timer_cap;
+static int ev_timer_count;
+static unsigned int current_time;
+
+static struct peer *peer_head;
+static struct conn **board;
 
 #define REPORT_ERRNO 1
 #define REPORT_FATAL 2
@@ -156,25 +160,22 @@ static void report(int flags, struct peer *p, const char *format, ...)
 
   /* scrub control characters and append newline */
   for (; *s; ++s)
-    if (*s < 0x20 || *s == 0x7f)
+    if ((*s < 0x20 && *s != '\n') || *s == 0x7f)
       *s = '?';
   *(s++) = '\n';
 
   write(2, buf, s - buf);
   if (p)
     write(p->logfd, buf, s - buf);
+  else
+    for (p = peer_head; p; p = p->next)
+      write(p->logfd, buf, s - buf);
 }
 
 #define msg(...) report(0, __VA_ARGS__)
 #define msg_sys(...) report(REPORT_ERRNO, __VA_ARGS__)
 #define die(...) report(REPORT_FATAL, __VA_ARGS__), exit(1)
 #define die_sys(...) report(REPORT_ERRNO | REPORT_FATAL, __VA_ARGS__), exit(1)
-
-#ifndef _WIN32
-# define die_socket(...) die_sys(__VA_ARGS__)
-#else
-# define die_socket(...) die(__VA_ARGS__)
-#endif
 
 static int parse_pint(const char *s, unsigned int *dest)
 {
@@ -294,13 +295,18 @@ static void conn_request(struct conn *c)
   while (!(c->have[index >> 3] & ~p->pend[index >> 3] & (mask = 128 >> (index & 7))))
     index = (index + 1) % num_pieces;
   p->pend[index >> 3] |= mask;
+
+  msg(p, "requesting %u from %u", index, c->id);
   conn_write_header(c, 4, P2P_REQUEST);
   conn_write_uint32(c, index);
   c->flags |= CONN_REQ;
   c->req = index;
-  for (c = p->conn_head; c; c = c->next)
-    if ((c->have[index >> 3] & mask) && !--c->num_want)
+  for (c = p->conn_head; c; c = c->next) {
+    if ((c->have[index >> 3] & mask) && !--c->num_want) {
+      msg(p, "sending not interested to %u", c->id);
       conn_write_header(c, 0, P2P_NOINT);
+    }
+  }
 }
 
 static void conn_read_have(struct conn *c, char *buf)
@@ -308,14 +314,13 @@ static void conn_read_have(struct conn *c, char *buf)
   struct peer *p = c->peer;
   unsigned int index = read_uint32(buf);
   if (index >= num_pieces) {
-    die(p, "received invalid 'have' for %u (max is %u) from %u.",
-        index, num_pieces - 1, c->id);
+    die(p, "received from %u invalid have %u (max %u)", c->id, index, num_pieces - 1);
   }
   unsigned char mask = 128 >> (index & 7);
   if (c->have[index >> 3] & mask) {
-    die(p, "received duplicate 'have' from %u for %u.", c->id, index);
+    die(p, "received from %u duplicate have %u", c->id, index);
   }
-  msg(p, "%u has %u", c->id, index);
+  msg(p, "from %u have %u", c->id, index);
   c->have[index >> 3] |= mask;
   ++c->num_have;
   if (!(p->pend[index >> 3] & mask) && !c->num_want++) {
@@ -323,8 +328,14 @@ static void conn_read_have(struct conn *c, char *buf)
     conn_request(c);
   }
   if (!c->wsize && p->num_have == num_pieces && c->num_have == num_pieces) {
-    msg(p, "closing connection with %u", c->id);
-    shutdown(c->sock, SHUT_WR);
+    if (c->flags & CONN_WFLOW) {
+      msg(p, "choking %u", c->id);
+      conn_write_header(c, 0, P2P_CHOKE);
+      c->flags &= ~CONN_WFLOW;
+    } else {
+      msg(p, "closing connection with %u", c->id);
+      shutdown(c->sock, SHUT_WR);
+    }
   }
 }
 
@@ -343,10 +354,14 @@ static void conn_read_bitfield(struct conn *c, char *buf)
     if (!(p->pend[index >> 3] & mask))
       ++c->num_want;
   }
+  msg(p, "received bitfield from %u (%u/%u, want %u)",
+      c->id, c->num_have, num_pieces, c->num_want);
   if (c->num_want) {
+    msg(p, "sending interested to %u", c->id);
     conn_write_header(c, 0, P2P_INT);
     conn_request(c);
   } else {
+    msg(p, "sending not interested to %u", c->id);
     conn_write_header(c, 0, P2P_NOINT);
   }
 }
@@ -355,13 +370,13 @@ static void conn_read_request(struct conn *c, char *buf)
 {
   struct peer *p = c->peer;
   uint32_t index = read_uint32(buf);
-  if (!(c->flags & CONN_WFLOW)) {
+  if (!(c->flags & CONN_WFLOW))
     return; /* choked */
-  }
-  if (index >= num_pieces) {
+  if (index >= num_pieces)
     die(p, "received invalid request for %u from %u (max is %u)",
         index, c->id, num_pieces - 1);
-  }
+
+  msg(p, "sending piece %u to %u", index, c->id);
   unsigned int offset = index * piece_size;
   unsigned int size = index == num_pieces - 1 ? the_file_size - offset : piece_size;
   conn_write_header(c, 4 + size, P2P_PIECE);
@@ -386,9 +401,6 @@ static void conn_read_piece(struct conn *c, char *buf)
   unsigned int offset = index * piece_size;
   unsigned int size = index == num_pieces - 1 ? the_file_size - offset : piece_size;
 
-  msg(p, "downloaded piece %u from %u (%u/%u)",
-      index, c->id, p->num_have, num_pieces);
-
   /* write piece to file */
   lseek(p->filefd, offset, SEEK_SET);
   write(p->filefd, buf + 4, size);
@@ -397,11 +409,15 @@ static void conn_read_piece(struct conn *c, char *buf)
   c->rrate += size;
   p->have[index >> 3] |= 128 >> (index & 7);
   ++p->num_have;
-  if (p->num_have == num_pieces) {
+
+  msg(p, "downloaded %u from %u (%u/%u)",
+      index, c->id, p->num_have, num_pieces);
+  if (p->num_have == num_pieces)
     msg(p, "download complete");
-  }
+
   conn_request(c);
   for (c = p->conn_head; c; c = c->next) {
+    msg(p, "sending have %u to %u", index, c->id);
     conn_write_header(c, 4, P2P_HAVE);
     conn_write_uint32(c, index);
   }
@@ -422,9 +438,12 @@ static void conn_read_message(struct conn *c, char *buf)
         c->flags &= ~CONN_REQ;
         unsigned char mask = 128 >> (c->req & 7);
         p->pend[c->req >> 3] &= ~mask;
-        for (c = p->conn_head; c; c = c->next)
-          if ((c->have[c->req >> 3] & mask) && !c->num_want++)
+        for (c = p->conn_head; c; c = c->next) {
+          if ((c->have[c->req >> 3] & mask) && !c->num_want++) {
+            msg(p, "sending interested to %u", c->id);
             conn_write_header(c, 0, P2P_INT);
+          }
+        }
         for (c = p->conn_head; c; c = c->next)
           conn_request(c);
       }
@@ -441,14 +460,14 @@ static void conn_read_message(struct conn *c, char *buf)
       if (len != 1) {
         die(p, "received 'interested' length %u, expected 1", len);
       }
-      msg(p, "%u is interested", c->id);
+      msg(p, "from %u interested", c->id);
       c->flags |= CONN_WINT;
       break;
     case P2P_NOINT:
       if (len != 1) {
         die(p, "received 'not interested' length %u, expected 1", len);
       }
-      msg(p, "%u is not interested", c->id);
+      msg(p, "from %u not interested", c->id);
       c->flags &= ~CONN_WINT;
       break;
     case P2P_HAVE:
@@ -491,8 +510,11 @@ static void conn_read_handshake(struct conn *c, char *buf)
     die(p, "received invalid handshake from %u", c->id);
   }
   msg(p, "received handshake from %u", c->id);
-  conn_write_header(c, bitfield_size, P2P_BITFIELD);
-  conn_write(c, p->have, bitfield_size);
+  if (p->num_have) {
+    msg(p, "sending bitfield (%u/%u pieces)", p->num_have, num_pieces);
+    conn_write_header(c, bitfield_size, P2P_BITFIELD);
+    conn_write(c, p->have, bitfield_size);
+  }
 }
 
 static int conn_handle_read(void *userdata)
@@ -545,10 +567,6 @@ static void peer_add(struct peer *p, int sock, struct peerinfo *info)
   conn_write(c, magic, sizeof(magic));
   conn_write_uint32(c, p->id);
   ev_register(c->sock, POLLIN, conn_handle_read, c);
-
-#ifndef _WIN32
-  fcntl(sock, F_SETFL, O_NONBLOCK);
-#endif
 }
 
 static void peer_connect(struct peer *p, struct peerinfo *info)
@@ -640,12 +658,16 @@ static int reselect_preferred_neighbors(void *userdata)
     if (i < count && i < num_preferred_neighbors) {
       if (len < sizeof(buf))
         len += snprintf(buf + len, sizeof(buf) - len, i ? ", %u" : "%u", board[i]->id);
-      if (!(c->flags & CONN_WFLOW))
+      if (!(c->flags & CONN_WFLOW)) {
+        msg(p, "unchoking %u", c->id);
         conn_write_header(c, 0, P2P_UNCHOKE);
+      }
       c->flags |= CONN_WPREF;
     } else {
-      if ((c->flags & CONN_WFLOW) == CONN_WPREF)
+      if ((c->flags & CONN_WFLOW) == CONN_WPREF) {
+        msg(p, "choking %u", c->id);
         conn_write_header(c, 0, P2P_CHOKE);
+      }
       c->flags &= ~CONN_WPREF;
     }
   }
@@ -687,6 +709,8 @@ static void peer_start(struct peerinfo *info)
   p->id = info->id;
   p->have = calloc(2, bitfield_size);
   p->pend = p->have + bitfield_size;
+  p->next = peer_head;
+  peer_head = p;
 
   if (info->has_file) {
     memset(p->have, -1, bitfield_size * 2);
@@ -706,9 +730,6 @@ static void peer_start(struct peerinfo *info)
   if (p->logfd == -1)
     die_sys(p, "failed to open '%s'", filename);
 
-  msg(p, "starting: interval=%u,%u num_pieces=%u",
-      unchoking_interval, optimistic_unchoking_interval, num_pieces);
-
   /* create the directory if necessary */
   snprintf(filename, sizeof(filename), "peer_%u", p->id);
   if (mkdir(filename, 0777) && errno != EEXIST)
@@ -722,13 +743,11 @@ static void peer_start(struct peerinfo *info)
 
   /* ensure the file has the right size */
   if (info->has_file) {
-    if (fstat(p->filefd, &st)) {
+    if (fstat(p->filefd, &st))
       die_sys(p, "failed to stat '%s'", filename);
-    }
-    if (st.st_size != the_file_size) {
+    if (st.st_size != the_file_size)
       die(p, "expected '%s' to be %u bytes, got %u",
           filename, the_file_size, (unsigned int)st.st_size);
-    }
   } else if (ftruncate(p->filefd, the_file_size)) {
     die_sys(p, "could not resize '%s' to %u bytes", filename, the_file_size);
   }
@@ -737,8 +756,8 @@ static void peer_start(struct peerinfo *info)
   for (struct peerinfo *prev = peerinfo; prev != info; prev = prev->next)
     peer_connect(p, prev);
 
-  ev_schedule(reselect_preferred_neighbors, p, unchoking_interval);
-  ev_schedule(optimistic_unchoke_neighbor, p, optimistic_unchoking_interval);
+  ev_schedule(reselect_preferred_neighbors, p, unchoking_interval * 1000);
+  ev_schedule(optimistic_unchoke_neighbor, p, optimistic_unchoking_interval * 1000);
 
   if (!(p->next_info = info->next))
     return;
@@ -770,12 +789,13 @@ static void config_load(const char *filename)
   FILE *f = fopen(filename, "r");
   if (!f)
     die_sys(NULL, "could not open '%s'", filename);
+
   char line[1024];
   while (fgets(line, sizeof(line), f)) {
     char *key = strtok(line, config_delim);
-    if (!key || key[0] == '#') {
+    if (!key || key[0] == '#')
       continue; /* empty line or comment */
-    }
+
     char *value = strtok(NULL, config_delim);
     if (!value || (
       !strcmp(key, "NumberOfPreferredNeighbors") ?
@@ -793,28 +813,26 @@ static void config_load(const char *filename)
     1)) die(NULL, "failed to parse '%s'", filename);
   }
   fclose(f);
-  unchoking_interval *= 1000;
-  optimistic_unchoking_interval *= 1000;
   num_pieces = (the_file_size + piece_size - 1) / piece_size;
   bitfield_size = (num_pieces + 7) >> 3;
 }
 
 static void peerinfo_load(const char *filename)
 {
-  char line[1024];
   FILE *f = fopen(filename, "r");
   if (!f)
     die_sys(NULL, "could not open '%s'", filename);
 
+  char line[1024];
   struct peerinfo **tail = &peerinfo;
 
   while (fgets(line, sizeof(line), f)) {
     char *fid, *host, *fprt, *fhas;
     unsigned int id, port;
     fid = strtok(line, config_delim);
-    if (!fid || fid[0] == '#') {
+    if (!fid || fid[0] == '#')
       continue; /* empty line or comment */
-    }
+
     if (!(host = strtok(NULL, config_delim)) ||
         !(fprt = strtok(NULL, config_delim)) ||
         !(fhas = strtok(NULL, config_delim)) ||
@@ -832,10 +850,6 @@ static void peerinfo_load(const char *filename)
     ++num_peers;
   }
   fclose(f);
-//if (self_sock == -1)
-//  die(p, "could not find self configuration");
-//close(self_sock);
-//board = calloc(conn_count, sizeof(*board));
 }
 
 int main(int argc, char **argv)
@@ -869,6 +883,24 @@ int main(int argc, char **argv)
     if (!id || id == info->id)
       peer_start(info);
 
+  msg(NULL,
+    "loaded configuration:\n"
+    "--------------------\n"
+    "NumberOfPreferredNeighbors %u\n"
+    "UnchokingInterval %u\n"
+    "OptimisticUnchokingInterval %u\n"
+    "FileName %s\n"
+    "FileSize %u\n"
+    "PieceSize %u\n"
+    "--------------------",
+    num_preferred_neighbors,
+    unchoking_interval,
+    optimistic_unchoking_interval,
+    the_file_name,
+    the_file_size,
+    piece_size
+  );
+
   /* event loop */
   while (ev_count) {
     /* update current time */
@@ -893,7 +925,6 @@ int main(int argc, char **argv)
           min = ev_timers[i].expire - current_time;
           m = i;
         }
-        ++i;
       }
       if (m) {
         struct ev_timer tmp = ev_timers[0];
