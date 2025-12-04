@@ -3,5 +3,6 @@
 /peer_*/
 *.cfg
 *.log
+*.mp4
 *.tar
 *.zip

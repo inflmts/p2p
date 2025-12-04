@@ -15,6 +15,7 @@
 # include <poll.h>
 # include <sys/socket.h>
 # include <unistd.h>
+# define O_BINARY 0
 # define closesocket(sock) close(sock)
 # define die_socket(...) die_sys(__VA_ARGS__)
 #else
@@ -726,7 +727,7 @@ static void peer_start(struct peerinfo *info)
 
   /* open log file */
   snprintf(filename, sizeof(filename), "log_peer_%u.log", p->id);
-  p->logfd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  p->logfd = open(filename, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0666);
   if (p->logfd == -1)
     die_sys(p, "failed to open '%s'", filename);
 
@@ -736,8 +737,9 @@ static void peer_start(struct peerinfo *info)
     die_sys(p, "failed to create directory '%s'", filename);
 
   /* open the file */
+  int flags = (info->has_file ? O_RDONLY : (O_RDWR | O_CREAT)) | O_BINARY;
   snprintf(filename, sizeof(filename), "peer_%u/%s", p->id, the_file_name);
-  p->filefd = open(filename, info->has_file ? O_RDONLY : (O_RDWR | O_CREAT), 0666);
+  p->filefd = open(filename, flags, 0666);
   if (p->filefd == -1)
     die_sys(p, "failed to open '%s'", filename);
 
@@ -786,7 +788,7 @@ static void peer_start(struct peerinfo *info)
 
 static void config_load(const char *filename)
 {
-  FILE *f = fopen(filename, "r");
+  FILE *f = fopen(filename, "rb");
   if (!f)
     die_sys(NULL, "could not open '%s'", filename);
 
@@ -819,7 +821,7 @@ static void config_load(const char *filename)
 
 static void peerinfo_load(const char *filename)
 {
-  FILE *f = fopen(filename, "r");
+  FILE *f = fopen(filename, "rb");
   if (!f)
     die_sys(NULL, "could not open '%s'", filename);
 
